@@ -1,10 +1,11 @@
 use embassy_nrf::gpio::Output;
 use embassy_nrf::pwm::{SequenceConfig, SequencePwm, SingleSequenceMode, SingleSequencer};
 use embassy_nrf::saadc::Saadc;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use rmk::ble::BleState;
 use rmk::channel::{ControllerSub, CONTROLLER_CHANNEL};
 use rmk::controller::{Controller, PollingController};
+use rmk::embassy_futures::select::{select, Either};
 use rmk::event::ControllerEvent;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -13,16 +14,26 @@ pub enum Role {
     Peripheral,
 }
 
-const POLL_INTERVAL_MS: u32 = 100;
-const BREATH_FRAMES: u32 = 30;
-const LOW_BLINK_PERIOD: u32 = 12;
-const NOTICE_FRAMES: u32 = 3_000 / POLL_INTERVAL_MS;
-const ACTIVITY_FRAMES: u32 = 60_000 / POLL_INTERVAL_MS;
-const LOW_ALERT_FRAMES: u32 = 5_000 / POLL_INTERVAL_MS;
-const LOW_REMINDER_FRAMES: u32 = 5 * 60_000 / POLL_INTERVAL_MS;
-const BATTERY_SAMPLE_FRAMES: u32 = 30_000 / POLL_INTERVAL_MS;
-const LEVEL: u8 = 0x10;
-const BREATH_PEAK: u8 = 0x20;
+// Polling cadence: fast while something is animating, slow when the LEDs are
+// idle. The slow tick only exists to notice USB plug/unplug and to trigger the
+// periodic battery sample, so it can be coarse to keep the radio asleep longer.
+const ANIM_INTERVAL: Duration = Duration::from_millis(33);
+const IDLE_INTERVAL: Duration = Duration::from_millis(1000);
+
+// Time-based status windows (decoupled from the polling cadence).
+const NOTICE: Duration = Duration::from_secs(3);
+const ACTIVITY: Duration = Duration::from_secs(60);
+const LOW_ALERT: Duration = Duration::from_secs(5);
+const LOW_QUIET: Duration = Duration::from_secs(5 * 60);
+const BATTERY_SAMPLE: Duration = Duration::from_secs(30);
+
+// Per-frame easing step toward the target color (~200 ms full fade at 30 fps).
+const FADE_STEP: u8 = 3;
+
+const BREATH_STEPS: usize = 64;
+const BREATH_PERIOD_MS: u64 = 3000;
+const LOW_BLINK_PERIOD_MS: u64 = 1200;
+
 const BATTERY_LOW: u8 = 20;
 const BATTERY_FULL: u8 = 95;
 const ADC_DIVIDER_MEASURED: i32 = 2000;
@@ -36,19 +47,29 @@ const SEQ_BITS: usize = 2 * 3 * 8;
 const SEQ_RESET: usize = 40;
 const SEQ_LEN: usize = SEQ_BITS + SEQ_RESET;
 
-const fn breath_table() -> [u8; BREATH_FRAMES as usize] {
-    let mut table = [0u8; BREATH_FRAMES as usize];
-    let half = BREATH_FRAMES / 2;
-    let mut i = 0u32;
-    while i < BREATH_FRAMES {
-        let up = if i <= half { i } else { BREATH_FRAMES - i };
-        table[i as usize] = ((up * BREATH_PEAK as u32) / half) as u8;
+/// Gamma-corrected breathing curve in `0..=255`, applied multiplicatively to a
+/// color so the hue is preserved while the perceived brightness eases smoothly.
+/// A linear ramp looks like it "jumps" bright then lingers dim; squaring it
+/// (gamma ~2) matches the eye's logarithmic response for a silky breath.
+const fn breath_lut() -> [u8; BREATH_STEPS] {
+    let mut table = [0u8; BREATH_STEPS];
+    let half = (BREATH_STEPS / 2) as u32;
+    let mut i = 0usize;
+    while i < BREATH_STEPS {
+        let up = if (i as u32) < half {
+            i as u32
+        } else {
+            BREATH_STEPS as u32 - i as u32
+        };
+        let lin = up * 1000 / half; // 0..=1000 triangle
+        let gamma = lin * lin / 1000; // gamma 2
+        table[i] = (gamma * 255 / 1000) as u8;
         i += 1;
     }
     table
 }
 
-static BREATH: [u8; BREATH_FRAMES as usize] = breath_table();
+static BREATH: [u8; BREATH_STEPS] = breath_lut();
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct Grb {
@@ -66,21 +87,13 @@ enum LightEffect {
 }
 
 const OFF: Grb = Grb { g: 0, r: 0, b: 0 };
-const RED: Grb = Grb {
-    g: 0,
-    r: LEVEL,
-    b: 0,
-};
-const GREEN: Grb = Grb {
-    g: LEVEL,
-    r: 0,
-    b: 0,
-};
-const BLUE: Grb = Grb {
-    g: 0,
-    r: 0,
-    b: LEVEL,
-};
+// Channel values are perceptually balanced (green reads brighter than red/blue
+// at equal drive) and kept low for power. Hues stay distinct at low brightness.
+const RED: Grb = Grb { g: 0, r: 18, b: 0 };
+const GREEN: Grb = Grb { g: 12, r: 0, b: 0 };
+const BLUE: Grb = Grb { g: 0, r: 0, b: 18 };
+const MAGENTA: Grb = Grb { g: 0, r: 14, b: 16 };
+const CYAN: Grb = Grb { g: 10, r: 0, b: 14 };
 
 pub struct Ws2812Indicator {
     pwm: SequencePwm<'static>,
@@ -97,13 +110,20 @@ pub struct Ws2812Indicator {
     peer_connected: bool,
     sleeping: bool,
 
-    tick: u32,
-    ble_frame: u32,
-    peer_frame: u32,
-    charge_frame: u32,
-    low_alert_frame: u32,
-    low_reminder_frame: u32,
-    battery_sample_frame: u32,
+    ble_since: Instant,
+    peer_since: Instant,
+    charge_since: Instant,
+    low_alert_until: Instant,
+    low_next_alert: Instant,
+    last_battery_sample: Option<Instant>,
+
+    cur_inner: Grb,
+    cur_outer: Grb,
+    tgt_inner: Grb,
+    tgt_outer: Grb,
+    inner_active: bool,
+    outer_active: bool,
+    pending: bool,
     rail_on: bool,
     last: Option<(Grb, Grb)>,
 }
@@ -116,6 +136,7 @@ impl Ws2812Indicator {
         role: Role,
     ) -> Self {
         ext_power.set_low();
+        let now = Instant::now();
         Self {
             pwm,
             ext_power,
@@ -132,13 +153,19 @@ impl Ws2812Indicator {
             ble_advertising: false,
             peer_connected: false,
             sleeping: false,
-            tick: 0,
-            ble_frame: 0,
-            peer_frame: 0,
-            charge_frame: 0,
-            low_alert_frame: LOW_ALERT_FRAMES,
-            low_reminder_frame: 0,
-            battery_sample_frame: 0,
+            ble_since: now,
+            peer_since: now,
+            charge_since: now,
+            low_alert_until: now,
+            low_next_alert: now,
+            last_battery_sample: None,
+            cur_inner: OFF,
+            cur_outer: OFF,
+            tgt_inner: OFF,
+            tgt_outer: OFF,
+            inner_active: false,
+            outer_active: false,
+            pending: true,
             rail_on: false,
             last: None,
         }
@@ -147,33 +174,26 @@ impl Ws2812Indicator {
     fn set_charging(&mut self, charging: bool) {
         if charging != self.charging {
             self.charging = charging;
-            self.charge_frame = 0;
+            self.charge_since = Instant::now();
+            self.pending = true;
         }
     }
 
     fn set_battery_level(&mut self, level: u8) {
-        let was_low = self.battery_at_most(BATTERY_LOW);
         let was_full = self.battery_at_least(BATTERY_FULL);
-
         self.battery = Some(level);
-
-        if level <= BATTERY_LOW && !was_low {
-            self.reset_low_alert();
-        } else if level > BATTERY_LOW {
-            self.low_alert_frame = LOW_ALERT_FRAMES;
-            self.low_reminder_frame = 0;
-        }
-
         if self.charging && level >= BATTERY_FULL && !was_full {
-            self.charge_frame = 0;
+            self.charge_since = Instant::now();
         }
+        self.pending = true;
     }
 
     fn set_peer_connected(&mut self, connected: bool) {
         if connected != self.peer_connected {
-            self.peer_frame = 0;
+            self.peer_since = Instant::now();
+            self.peer_connected = connected;
+            self.pending = true;
         }
-        self.peer_connected = connected;
     }
 
     fn set_ble_state(&mut self, profile: u8, state: BleState) {
@@ -184,7 +204,8 @@ impl Ws2812Indicator {
             || profile != self.ble_profile;
 
         if changed {
-            self.ble_frame = 0;
+            self.ble_since = Instant::now();
+            self.pending = true;
         }
 
         self.ble_profile = profile;
@@ -192,17 +213,24 @@ impl Ws2812Indicator {
         self.ble_advertising = advertising;
     }
 
-    fn set_sleeping(&mut self, sleeping: bool) {
-        if self.sleeping != sleeping && !sleeping {
-            self.ble_frame = 0;
-            self.peer_frame = 0;
+    fn set_ble_profile(&mut self, profile: u8) {
+        if profile != self.ble_profile {
+            self.ble_profile = profile;
+            self.ble_since = Instant::now();
+            self.pending = true;
         }
-        self.sleeping = sleeping;
     }
 
-    fn reset_low_alert(&mut self) {
-        self.low_alert_frame = 0;
-        self.low_reminder_frame = 0;
+    fn set_sleeping(&mut self, sleeping: bool) {
+        if self.sleeping != sleeping {
+            if !sleeping {
+                // Re-show the connection/peer notices when waking up.
+                self.ble_since = Instant::now();
+                self.peer_since = Instant::now();
+            }
+            self.sleeping = sleeping;
+            self.pending = true;
+        }
     }
 
     fn profile_color(&self) -> Grb {
@@ -210,22 +238,29 @@ impl Ws2812Indicator {
             0 => RED,
             1 => GREEN,
             2 => BLUE,
-            _ => BLUE,
+            3 => MAGENTA,
+            _ => CYAN,
+        }
+    }
+
+    fn breath_level(&self) -> u8 {
+        let ms = Instant::now().as_millis() % BREATH_PERIOD_MS;
+        let idx = (ms as usize * BREATH_STEPS / BREATH_PERIOD_MS as usize) % BREATH_STEPS;
+        BREATH[idx]
+    }
+
+    fn breath_color(&self, color: Grb) -> Grb {
+        let level = self.breath_level() as u16;
+        Grb {
+            g: (color.g as u16 * level / 255) as u8,
+            r: (color.r as u16 * level / 255) as u8,
+            b: (color.b as u16 * level / 255) as u8,
         }
     }
 
     fn low_blink_on(&self) -> bool {
-        let phase = self.tick % LOW_BLINK_PERIOD;
-        phase < 2 || (4..6).contains(&phase)
-    }
-
-    fn breath_color(&self, color: Grb) -> Grb {
-        let level = BREATH[(self.tick % BREATH_FRAMES) as usize];
-        Grb {
-            g: if color.g > 0 { level } else { 0 },
-            r: if color.r > 0 { level } else { 0 },
-            b: if color.b > 0 { level } else { 0 },
-        }
+        let ms = Instant::now().as_millis() % LOW_BLINK_PERIOD_MS;
+        ms < 200 || (400..600).contains(&ms)
     }
 
     fn effect_color(&self, effect: LightEffect) -> Grb {
@@ -251,18 +286,14 @@ impl Ws2812Indicator {
         matches!(self.battery, Some(level) if level <= threshold)
     }
 
-    fn low_battery_effect(&self) -> Option<LightEffect> {
-        if self.battery_at_most(BATTERY_LOW) && self.low_alert_frame < LOW_ALERT_FRAMES {
-            Some(LightEffect::LowBattery)
-        } else {
-            None
-        }
+    fn low_blinking(&self) -> bool {
+        self.battery_at_most(BATTERY_LOW) && Instant::now() < self.low_alert_until
     }
 
     fn inner_effect(&self) -> LightEffect {
         if self.charging {
             if self.battery_at_least(BATTERY_FULL) {
-                return if self.charge_frame < NOTICE_FRAMES {
+                return if self.charge_since.elapsed() < NOTICE {
                     LightEffect::Solid(GREEN)
                 } else {
                     LightEffect::Off
@@ -271,19 +302,19 @@ impl Ws2812Indicator {
             return LightEffect::Breath(GREEN);
         }
 
-        if let Some(effect) = self.low_battery_effect() {
-            return effect;
+        if self.low_blinking() {
+            return LightEffect::LowBattery;
         }
 
         if self.role == Role::Central {
             if !self.peer_connected {
-                return if self.peer_frame < ACTIVITY_FRAMES {
+                return if self.peer_since.elapsed() < ACTIVITY {
                     LightEffect::Breath(BLUE)
                 } else {
                     LightEffect::Off
                 };
             }
-            if self.peer_frame < NOTICE_FRAMES {
+            if self.peer_since.elapsed() < NOTICE {
                 return LightEffect::Solid(BLUE);
             }
         }
@@ -295,12 +326,12 @@ impl Ws2812Indicator {
         match self.role {
             Role::Central => {
                 if self.ble_connected {
-                    if self.ble_frame < NOTICE_FRAMES {
+                    if self.ble_since.elapsed() < NOTICE {
                         LightEffect::Solid(self.profile_color())
                     } else {
                         LightEffect::Off
                     }
-                } else if self.ble_advertising && self.ble_frame < ACTIVITY_FRAMES {
+                } else if self.ble_advertising && self.ble_since.elapsed() < ACTIVITY {
                     LightEffect::Breath(self.profile_color())
                 } else {
                     LightEffect::Off
@@ -308,12 +339,12 @@ impl Ws2812Indicator {
             }
             Role::Peripheral => {
                 if self.peer_connected {
-                    if self.peer_frame < NOTICE_FRAMES {
+                    if self.peer_since.elapsed() < NOTICE {
                         LightEffect::Solid(BLUE)
                     } else {
                         LightEffect::Off
                     }
-                } else if self.peer_frame < ACTIVITY_FRAMES {
+                } else if self.peer_since.elapsed() < ACTIVITY {
                     LightEffect::Breath(BLUE)
                 } else {
                     LightEffect::Off
@@ -336,10 +367,15 @@ impl Ws2812Indicator {
         }
     }
 
-    async fn sample_battery_if_due(&mut self) {
-        if self.battery_sample_frame != 0 {
+    async fn sample_battery_if_due(&mut self, now: Instant) {
+        let due = match self.last_battery_sample {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= BATTERY_SAMPLE,
+        };
+        if !due {
             return;
         }
+        self.last_battery_sample = Some(now);
 
         let Some(battery_adc) = self.battery_adc.as_mut() else {
             return;
@@ -350,30 +386,50 @@ impl Ws2812Indicator {
         self.set_battery_level(Self::battery_percent_from_adc(buf[0]));
     }
 
-    fn update_low_battery_timers(&mut self) {
+    /// Schedule the low-battery alert: blink for `LOW_ALERT`, stay quiet for
+    /// `LOW_QUIET`, then repeat while the battery remains low.
+    fn refresh_low_battery(&mut self, now: Instant) {
         if !self.battery_at_most(BATTERY_LOW) {
-            self.low_alert_frame = LOW_ALERT_FRAMES;
-            self.low_reminder_frame = 0;
+            // Not low: keep the schedule armed at `now` so a fresh drop back into
+            // low battery alerts immediately, instead of being deferred by a
+            // stale quiet window left over from a previous low-battery episode.
+            self.low_alert_until = now;
+            self.low_next_alert = now;
             return;
         }
-
-        if self.low_alert_frame < LOW_ALERT_FRAMES {
-            self.low_alert_frame += 1;
-        } else {
-            self.low_reminder_frame = self.low_reminder_frame.saturating_add(1);
-            if self.low_reminder_frame >= LOW_REMINDER_FRAMES {
-                self.reset_low_alert();
-            }
+        if now >= self.low_next_alert {
+            self.low_alert_until = now + LOW_ALERT;
+            self.low_next_alert = now + LOW_ALERT + LOW_QUIET;
         }
     }
 
-    fn advance_frames(&mut self) {
-        self.tick = self.tick.wrapping_add(1);
-        self.ble_frame = self.ble_frame.saturating_add(1);
-        self.peer_frame = self.peer_frame.saturating_add(1);
-        self.charge_frame = self.charge_frame.saturating_add(1);
-        self.battery_sample_frame = (self.battery_sample_frame + 1) % BATTERY_SAMPLE_FRAMES;
-        self.update_low_battery_timers();
+    fn is_animating(&self) -> bool {
+        // A logically-active effect (breath / blink / notice) must keep the fast
+        // cadence even when its instantaneous color is momentarily OFF, e.g. the
+        // breath trough or the dark phase of the low-battery blink. A fade that
+        // has not settled to its target yet also counts.
+        self.inner_active
+            || self.outer_active
+            || self.cur_inner != self.tgt_inner
+            || self.cur_outer != self.tgt_outer
+    }
+
+    fn approach_channel(cur: u8, target: u8, step: u8) -> u8 {
+        if cur < target {
+            cur.saturating_add(step).min(target)
+        } else if cur > target {
+            cur.saturating_sub(step).max(target)
+        } else {
+            cur
+        }
+    }
+
+    fn approach(cur: Grb, target: Grb, step: u8) -> Grb {
+        Grb {
+            g: Self::approach_channel(cur.g, target.g, step),
+            r: Self::approach_channel(cur.r, target.r, step),
+            b: Self::approach_channel(cur.b, target.b, step),
+        }
     }
 
     fn encode(buf: &mut [u16; SEQ_LEN], inner: Grb, outer: Grb) {
@@ -415,6 +471,8 @@ impl Ws2812Indicator {
             }
         }
 
+        // Only cut the rail once the fade-out has fully settled to off, so the
+        // last visible frame is black rather than an abrupt power cut.
         if !any_on {
             self.ext_power.set_low();
             self.rail_on = false;
@@ -439,10 +497,7 @@ impl Controller for Ws2812Indicator {
                 self.set_ble_state(profile, state);
             }
             ControllerEvent::BleProfile(profile) if self.role == Role::Central => {
-                if profile != self.ble_profile {
-                    self.ble_profile = profile;
-                    self.ble_frame = 0;
-                }
+                self.set_ble_profile(profile);
             }
             ControllerEvent::Sleep(sleeping) => self.set_sleeping(sleeping),
             _ => {}
@@ -455,21 +510,83 @@ impl Controller for Ws2812Indicator {
 }
 
 impl PollingController for Ws2812Indicator {
-    const INTERVAL: Duration = Duration::from_millis(POLL_INTERVAL_MS as u64);
+    // Required by the trait; the adaptive `polling_loop` below picks the actual
+    // cadence per cycle, so this is just the fast (animation) interval.
+    const INTERVAL: Duration = ANIM_INTERVAL;
 
     async fn update(&mut self) {
+        let now = Instant::now();
+
         if self.sleeping {
-            self.render(OFF, OFF).await;
-            return;
+            self.inner_active = false;
+            self.outer_active = false;
+            self.tgt_inner = OFF;
+            self.tgt_outer = OFF;
+        } else {
+            let usb_present = embassy_nrf::pac::POWER.usbregstatus().read().vbusdetect();
+            self.set_charging(usb_present);
+            self.sample_battery_if_due(now).await;
+            self.refresh_low_battery(now);
+            let inner = self.inner_effect();
+            let outer = self.outer_effect();
+            self.inner_active = !matches!(inner, LightEffect::Off);
+            self.outer_active = !matches!(outer, LightEffect::Off);
+            self.tgt_inner = self.effect_color(inner);
+            self.tgt_outer = self.effect_color(outer);
         }
 
-        let usb_present = embassy_nrf::pac::POWER.usbregstatus().read().vbusdetect();
-        self.set_charging(usb_present);
-        self.sample_battery_if_due().await;
+        self.cur_inner = Self::approach(self.cur_inner, self.tgt_inner, FADE_STEP);
+        self.cur_outer = Self::approach(self.cur_outer, self.tgt_outer, FADE_STEP);
+        self.render(self.cur_inner, self.cur_outer).await;
+        self.pending = false;
+    }
 
-        let inner = self.effect_color(self.inner_effect());
-        let outer = self.effect_color(self.outer_effect());
-        self.render(inner, outer).await;
-        self.advance_frames();
+    /// Adaptive loop: animate at ~30 fps while anything is lit or fading, and
+    /// drop to a slow idle tick once the LEDs settle to off, which lets the
+    /// radio sleep undisturbed and cuts idle wakeups roughly tenfold.
+    ///
+    /// Tracks an absolute deadline rather than restarting the wait on every
+    /// event. Key presses are published to the controller channel, so during
+    /// fast typing events arrive continuously; resetting the interval each time
+    /// would push `update()` out indefinitely and starve the animation,
+    /// fade-out and battery sampling.
+    async fn polling_loop(&mut self) {
+        let mut deadline = Instant::now();
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                self.update().await;
+                let interval = if self.is_animating() {
+                    ANIM_INTERVAL
+                } else {
+                    IDLE_INTERVAL
+                };
+                deadline = Instant::now() + interval;
+                continue;
+            }
+
+            match select(Timer::after(deadline - now), self.next_message()).await {
+                Either::First(_) => {
+                    self.update().await;
+                    let interval = if self.is_animating() {
+                        ANIM_INTERVAL
+                    } else {
+                        IDLE_INTERVAL
+                    };
+                    deadline = Instant::now() + interval;
+                }
+                Either::Second(event) => {
+                    self.process_event(event).await;
+                    // Reflect a state-changing event promptly by pulling the
+                    // deadline in; never push it out (ignored events keep it).
+                    if self.pending {
+                        let soon = Instant::now() + ANIM_INTERVAL;
+                        if soon < deadline {
+                            deadline = soon;
+                        }
+                    }
+                }
+            }
+        }
     }
 }

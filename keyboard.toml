@@ -8,7 +8,7 @@ chip = "nrf52840"
 
 [ble]
 enabled = true
-ble_use_2m_phy = false
+ble_use_2m_phy = true
 default_tx_power = 4
 battery_adc_pin = "P0_05"
 adc_divider_measured = 2000
