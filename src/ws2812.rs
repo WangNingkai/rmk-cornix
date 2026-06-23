@@ -13,16 +13,18 @@ pub enum Role {
     Peripheral,
 }
 
-const BREATH_FRAMES: u32 = 60;
-const BLINK_PERIOD: u32 = 30;
-const CONNECT_SHOW_FRAMES: u32 = 75;
-const PEER_SHOW_FRAMES: u32 = 90;
-const FULL_SHOW_FRAMES: u32 = 90;
+const POLL_INTERVAL_MS: u32 = 100;
+const BREATH_FRAMES: u32 = 30;
+const LOW_BLINK_PERIOD: u32 = 12;
+const NOTICE_FRAMES: u32 = 3_000 / POLL_INTERVAL_MS;
+const ACTIVITY_FRAMES: u32 = 60_000 / POLL_INTERVAL_MS;
+const LOW_ALERT_FRAMES: u32 = 5_000 / POLL_INTERVAL_MS;
+const LOW_REMINDER_FRAMES: u32 = 5 * 60_000 / POLL_INTERVAL_MS;
+const BATTERY_SAMPLE_FRAMES: u32 = 30_000 / POLL_INTERVAL_MS;
 const LEVEL: u8 = 0x10;
 const BREATH_PEAK: u8 = 0x20;
 const BATTERY_LOW: u8 = 20;
 const BATTERY_FULL: u8 = 95;
-const BATTERY_SAMPLE_FRAMES: u32 = 900;
 const ADC_DIVIDER_MEASURED: i32 = 2000;
 const ADC_DIVIDER_TOTAL: i32 = 2806;
 
@@ -53,6 +55,14 @@ struct Grb {
     g: u8,
     r: u8,
     b: u8,
+}
+
+#[derive(Clone, Copy)]
+enum LightEffect {
+    Off,
+    Solid(Grb),
+    Breath(Grb),
+    LowBattery,
 }
 
 const OFF: Grb = Grb { g: 0, r: 0, b: 0 };
@@ -91,6 +101,8 @@ pub struct Ws2812Indicator {
     ble_frame: u32,
     peer_frame: u32,
     charge_frame: u32,
+    low_alert_frame: u32,
+    low_reminder_frame: u32,
     battery_sample_frame: u32,
     rail_on: bool,
     last: Option<(Grb, Grb)>,
@@ -124,6 +136,8 @@ impl Ws2812Indicator {
             ble_frame: 0,
             peer_frame: 0,
             charge_frame: 0,
+            low_alert_frame: LOW_ALERT_FRAMES,
+            low_reminder_frame: 0,
             battery_sample_frame: 0,
             rail_on: false,
             last: None,
@@ -137,6 +151,60 @@ impl Ws2812Indicator {
         }
     }
 
+    fn set_battery_level(&mut self, level: u8) {
+        let was_low = self.battery_at_most(BATTERY_LOW);
+        let was_full = self.battery_at_least(BATTERY_FULL);
+
+        self.battery = Some(level);
+
+        if level <= BATTERY_LOW && !was_low {
+            self.reset_low_alert();
+        } else if level > BATTERY_LOW {
+            self.low_alert_frame = LOW_ALERT_FRAMES;
+            self.low_reminder_frame = 0;
+        }
+
+        if self.charging && level >= BATTERY_FULL && !was_full {
+            self.charge_frame = 0;
+        }
+    }
+
+    fn set_peer_connected(&mut self, connected: bool) {
+        if connected != self.peer_connected {
+            self.peer_frame = 0;
+        }
+        self.peer_connected = connected;
+    }
+
+    fn set_ble_state(&mut self, profile: u8, state: BleState) {
+        let connected = matches!(state, BleState::Connected);
+        let advertising = matches!(state, BleState::Advertising);
+        let changed = connected != self.ble_connected
+            || advertising != self.ble_advertising
+            || profile != self.ble_profile;
+
+        if changed {
+            self.ble_frame = 0;
+        }
+
+        self.ble_profile = profile;
+        self.ble_connected = connected;
+        self.ble_advertising = advertising;
+    }
+
+    fn set_sleeping(&mut self, sleeping: bool) {
+        if self.sleeping != sleeping && !sleeping {
+            self.ble_frame = 0;
+            self.peer_frame = 0;
+        }
+        self.sleeping = sleeping;
+    }
+
+    fn reset_low_alert(&mut self) {
+        self.low_alert_frame = 0;
+        self.low_reminder_frame = 0;
+    }
+
     fn profile_color(&self) -> Grb {
         match self.ble_profile {
             0 => RED,
@@ -146,9 +214,9 @@ impl Ws2812Indicator {
         }
     }
 
-    fn double_blink_on(&self) -> bool {
-        let phase = self.tick % BLINK_PERIOD;
-        phase < 6 || (12..18).contains(&phase)
+    fn low_blink_on(&self) -> bool {
+        let phase = self.tick % LOW_BLINK_PERIOD;
+        phase < 2 || (4..6).contains(&phase)
     }
 
     fn breath_color(&self, color: Grb) -> Grb {
@@ -160,6 +228,21 @@ impl Ws2812Indicator {
         }
     }
 
+    fn effect_color(&self, effect: LightEffect) -> Grb {
+        match effect {
+            LightEffect::Off => OFF,
+            LightEffect::Solid(color) => color,
+            LightEffect::Breath(color) => self.breath_color(color),
+            LightEffect::LowBattery => {
+                if self.low_blink_on() {
+                    RED
+                } else {
+                    OFF
+                }
+            }
+        }
+    }
+
     fn battery_at_least(&self, threshold: u8) -> bool {
         matches!(self.battery, Some(level) if level >= threshold)
     }
@@ -168,58 +251,72 @@ impl Ws2812Indicator {
         matches!(self.battery, Some(level) if level <= threshold)
     }
 
-    fn inner_color(&self) -> Grb {
+    fn low_battery_effect(&self) -> Option<LightEffect> {
+        if self.battery_at_most(BATTERY_LOW) && self.low_alert_frame < LOW_ALERT_FRAMES {
+            Some(LightEffect::LowBattery)
+        } else {
+            None
+        }
+    }
+
+    fn inner_effect(&self) -> LightEffect {
         if self.charging {
             if self.battery_at_least(BATTERY_FULL) {
-                return if self.charge_frame < FULL_SHOW_FRAMES {
-                    GREEN
+                return if self.charge_frame < NOTICE_FRAMES {
+                    LightEffect::Solid(GREEN)
                 } else {
-                    OFF
+                    LightEffect::Off
                 };
             }
-            return self.breath_color(GREEN);
+            return LightEffect::Breath(GREEN);
+        }
+
+        if let Some(effect) = self.low_battery_effect() {
+            return effect;
         }
 
         if self.role == Role::Central {
             if !self.peer_connected {
-                return self.breath_color(BLUE);
+                return if self.peer_frame < ACTIVITY_FRAMES {
+                    LightEffect::Breath(BLUE)
+                } else {
+                    LightEffect::Off
+                };
             }
-            if self.peer_frame < PEER_SHOW_FRAMES {
-                return BLUE;
+            if self.peer_frame < NOTICE_FRAMES {
+                return LightEffect::Solid(BLUE);
             }
         }
 
-        if self.battery_at_most(BATTERY_LOW) {
-            return if self.double_blink_on() { RED } else { OFF };
-        }
-
-        OFF
+        LightEffect::Off
     }
 
-    fn outer_color(&self) -> Grb {
+    fn outer_effect(&self) -> LightEffect {
         match self.role {
             Role::Central => {
                 if self.ble_connected {
-                    if self.ble_frame < CONNECT_SHOW_FRAMES {
-                        self.profile_color()
+                    if self.ble_frame < NOTICE_FRAMES {
+                        LightEffect::Solid(self.profile_color())
                     } else {
-                        OFF
+                        LightEffect::Off
                     }
-                } else if self.ble_advertising {
-                    self.breath_color(self.profile_color())
+                } else if self.ble_advertising && self.ble_frame < ACTIVITY_FRAMES {
+                    LightEffect::Breath(self.profile_color())
                 } else {
-                    OFF
+                    LightEffect::Off
                 }
             }
             Role::Peripheral => {
                 if self.peer_connected {
-                    if self.peer_frame < PEER_SHOW_FRAMES {
-                        BLUE
+                    if self.peer_frame < NOTICE_FRAMES {
+                        LightEffect::Solid(BLUE)
                     } else {
-                        OFF
+                        LightEffect::Off
                     }
+                } else if self.peer_frame < ACTIVITY_FRAMES {
+                    LightEffect::Breath(BLUE)
                 } else {
-                    self.breath_color(BLUE)
+                    LightEffect::Off
                 }
             }
         }
@@ -244,19 +341,39 @@ impl Ws2812Indicator {
             return;
         }
 
-        let was_full = self.battery_at_least(BATTERY_FULL);
         let Some(battery_adc) = self.battery_adc.as_mut() else {
             return;
         };
 
         let mut buf = [0i16; 1];
         battery_adc.sample(&mut buf).await;
+        self.set_battery_level(Self::battery_percent_from_adc(buf[0]));
+    }
 
-        let level = Self::battery_percent_from_adc(buf[0]);
-        self.battery = Some(level);
-        if self.charging && level >= BATTERY_FULL && !was_full {
-            self.charge_frame = 0;
+    fn update_low_battery_timers(&mut self) {
+        if !self.battery_at_most(BATTERY_LOW) {
+            self.low_alert_frame = LOW_ALERT_FRAMES;
+            self.low_reminder_frame = 0;
+            return;
         }
+
+        if self.low_alert_frame < LOW_ALERT_FRAMES {
+            self.low_alert_frame += 1;
+        } else {
+            self.low_reminder_frame = self.low_reminder_frame.saturating_add(1);
+            if self.low_reminder_frame >= LOW_REMINDER_FRAMES {
+                self.reset_low_alert();
+            }
+        }
+    }
+
+    fn advance_frames(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+        self.ble_frame = self.ble_frame.saturating_add(1);
+        self.peer_frame = self.peer_frame.saturating_add(1);
+        self.charge_frame = self.charge_frame.saturating_add(1);
+        self.battery_sample_frame = (self.battery_sample_frame + 1) % BATTERY_SAMPLE_FRAMES;
+        self.update_low_battery_timers();
     }
 
     fn encode(buf: &mut [u16; SEQ_LEN], inner: Grb, outer: Grb) {
@@ -310,38 +427,16 @@ impl Controller for Ws2812Indicator {
 
     async fn process_event(&mut self, event: Self::Event) {
         match event {
-            ControllerEvent::Battery(level) => {
-                let was_full = self.battery_at_least(BATTERY_FULL);
-                self.battery = Some(level);
-                if self.charging && level >= BATTERY_FULL && !was_full {
-                    self.charge_frame = 0;
-                }
-            }
+            ControllerEvent::Battery(level) => self.set_battery_level(level),
             ControllerEvent::ChargingState(charging) => self.set_charging(charging),
             ControllerEvent::SplitPeripheral(_, connected) if self.role == Role::Central => {
-                if connected != self.peer_connected {
-                    self.peer_connected = connected;
-                    self.peer_frame = 0;
-                }
+                self.set_peer_connected(connected);
             }
             ControllerEvent::SplitCentral(connected) if self.role == Role::Peripheral => {
-                if connected != self.peer_connected {
-                    self.peer_connected = connected;
-                    self.peer_frame = 0;
-                }
+                self.set_peer_connected(connected);
             }
             ControllerEvent::BleState(profile, state) if self.role == Role::Central => {
-                let connected = matches!(state, BleState::Connected);
-                let advertising = matches!(state, BleState::Advertising);
-                if (connected && !self.ble_connected)
-                    || (advertising && !self.ble_advertising)
-                    || profile != self.ble_profile
-                {
-                    self.ble_frame = 0;
-                }
-                self.ble_profile = profile;
-                self.ble_connected = connected;
-                self.ble_advertising = advertising;
+                self.set_ble_state(profile, state);
             }
             ControllerEvent::BleProfile(profile) if self.role == Role::Central => {
                 if profile != self.ble_profile {
@@ -349,15 +444,7 @@ impl Controller for Ws2812Indicator {
                     self.ble_frame = 0;
                 }
             }
-            ControllerEvent::KeyboardIndicator(_) if self.role == Role::Central => {
-                if !self.ble_connected {
-                    self.ble_connected = true;
-                    self.ble_frame = 0;
-                }
-            }
-            ControllerEvent::Sleep(sleeping) => {
-                self.sleeping = sleeping;
-            }
+            ControllerEvent::Sleep(sleeping) => self.set_sleeping(sleeping),
             _ => {}
         }
     }
@@ -368,7 +455,7 @@ impl Controller for Ws2812Indicator {
 }
 
 impl PollingController for Ws2812Indicator {
-    const INTERVAL: Duration = Duration::from_millis(33);
+    const INTERVAL: Duration = Duration::from_millis(POLL_INTERVAL_MS as u64);
 
     async fn update(&mut self) {
         if self.sleeping {
@@ -380,13 +467,9 @@ impl PollingController for Ws2812Indicator {
         self.set_charging(usb_present);
         self.sample_battery_if_due().await;
 
-        let inner = self.inner_color();
-        let outer = self.outer_color();
+        let inner = self.effect_color(self.inner_effect());
+        let outer = self.effect_color(self.outer_effect());
         self.render(inner, outer).await;
-        self.tick = self.tick.wrapping_add(1);
-        self.ble_frame = self.ble_frame.wrapping_add(1);
-        self.peer_frame = self.peer_frame.wrapping_add(1);
-        self.charge_frame = self.charge_frame.wrapping_add(1);
-        self.battery_sample_frame = (self.battery_sample_frame + 1) % BATTERY_SAMPLE_FRAMES;
+        self.advance_frames();
     }
 }

@@ -7,7 +7,45 @@ on:
 
 jobs:
   build:
-    uses: haobogu/rmk/.github/workflows/user_build.yml@main
-    with:
-      keyboard_toml_path: "keyboard.toml"
-      vial_json_path: "vial.json"
+    runs-on: ubuntu-latest
+    env:
+      KEYBOARD_TOML_PATH: keyboard.toml
+      VIAL_JSON_PATH: vial.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 \
+            --profile minimal \
+            --target thumbv7em-none-eabihf \
+            --component rust-src \
+            --component rustfmt \
+            --component clippy \
+            --component llvm-tools
+          rustup default 1.96.0
+
+      - name: Install cargo-make
+        run: cargo install cargo-make --locked --version 0.37.24
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --release --bins -- -D warnings
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Build UF2 artifacts
+        run: cargo make uf2
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rmk-cornix-firmware
+          path: |
+            rmk-cornix-central.hex
+            rmk-cornix-central.uf2
+            rmk-cornix-peripheral.hex
+            rmk-cornix-peripheral.uf2

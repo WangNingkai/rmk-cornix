@@ -8,6 +8,8 @@ own RMK firmware for Cornix, not to replicate the official firmware.
 
 - It supports all keys and rotary encoders.
 - It supports Vial.
+- It supports the onboard RGB status indicators for battery and connection
+  status.
 - Its Vial layout is roughlly compatible with the official firmware, so you can
   load your existing Vial layout (`.vil` file) without much modification.
   Macros, combos, tap dances, key maps for rotary encoders, and some other
@@ -15,8 +17,13 @@ own RMK firmware for Cornix, not to replicate the official firmware.
 
 # Notes
 
-- LED lighting is not supported.
-- Optimization on BLE or power consumption is not made.
+- Full RGB lighting effects are not supported. The onboard LEDs are used only as
+  short status indicators.
+- BLE is configured for balanced daily use: 1M PHY, +4 dBm TX power, and split
+  central sleep after 5 minutes of inactivity.
+- Status LEDs are power-limited. Connection/profile events show for 3 seconds,
+  advertising/disconnected breathing stops after 60 seconds, and low battery
+  reminders blink briefly every 5 minutes.
 
 # Usage
 
@@ -24,10 +31,11 @@ own RMK firmware for Cornix, not to replicate the official firmware.
 
 2. Build the firmware. Execute in the repository root:
    ```sh
-   cargo build --release
+   cargo make uf2
    ```
    This will generate two `.uf2` files in the repository root. Make sure you
-   have the Rust toolchain.
+   have the pinned Rust toolchain and `cargo-make` installed. `cargo build
+   --release` only builds the ELF binaries under `target/`.
 
    Otherwise, fork this repository, go to GitHub Actions tab, tap *Build RMK
    firmware*, and download the artifacts when the build is done.
