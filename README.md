@@ -19,7 +19,7 @@ own RMK firmware for Cornix, not to replicate the official firmware.
 
 - Full RGB lighting effects are not supported. The onboard LEDs are used only as
   short status indicators.
-- BLE is configured for balanced daily use: 2M PHY, +4 dBm TX power, and split
+- BLE is configured for balanced daily use: 2M PHY, +8 dBm TX power, and split
   central sleep after 5 minutes of inactivity.
 - Status LEDs use an adaptive refresh: they run smooth, gamma-corrected
   breathing with soft fade in/out while active, and drop to a slow idle tick

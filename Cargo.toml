@@ -59,6 +59,7 @@ json = "0.12"
 const-gen = "1.6"
 
 [patch.crates-io]
+rmk = { path = "vendor/rmk" }
 rmk-macro = { path = "vendor/rmk-macro" }
 
 # Split keyboard example

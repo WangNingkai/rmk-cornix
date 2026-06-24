@@ -2,3 +2,10 @@
 *.hex
 *.uf2
 *.vil
+
+# Generated or registry-only files inside vendored Rust crates
+/vendor/**/target/
+/vendor/**/.cargo-ok
+/vendor/**/.cargo_vcs_info.json
+/vendor/**/Cargo.lock
+/vendor/**/Cargo.toml.orig
