@@ -1,0 +1,324 @@
+# Instincts generated from https://github.com/WangNingkai/rmk-cornix
+# Generated: 2026-06-25T08:45:00.265Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: rmk-cornix-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: feat, perf
+
+## Evidence
+
+- 4 commits analyzed
+- Detected conventional commit pattern
+- Examples: perf(firmware): reduce idle power draw, feat(ble): report split peripheral battery to host
+
+---
+id: rmk-cornix-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Commit Length
+
+## Action
+
+Keep commit messages concise (~41 characters)
+
+## Evidence
+
+- Average commit message length: 41 chars
+- Based on 4 commits
+
+---
+id: rmk-cornix-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: rmk-cornix-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: rmk-cornix-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: rmk-cornix-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: rmk-cornix-workflow-update-status-led-colors
+trigger: "when doing update status led colors"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Workflow Update Status Led Colors
+
+## Action
+
+Follow the update-status-led-colors workflow:
+1. Edit src/ws2812.rs to change LED color values or logic.
+2. Update README.md to reflect the new color palette and document usage.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: src/ws2812.rs, README.md
+
+---
+id: rmk-cornix-instinct-file-naming
+trigger: "When creating or renaming a source file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Instinct File Naming
+
+## Action
+
+Name the file using camelCase (e.g., ws2812.rs)
+
+## Evidence
+
+- Pattern in namingConventions.files: 'camelCase'
+- Example: src/ws2812.rs
+
+---
+id: rmk-cornix-instinct-function-naming
+trigger: "When defining a function"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Instinct Function Naming
+
+## Action
+
+Name the function using camelCase
+
+## Evidence
+
+- Pattern in namingConventions.functions: 'camelCase'
+
+---
+id: rmk-cornix-instinct-class-naming
+trigger: "When defining a class or struct"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Instinct Class Naming
+
+## Action
+
+Name the class or struct using PascalCase
+
+## Evidence
+
+- Pattern in namingConventions.classes: 'PascalCase'
+
+---
+id: rmk-cornix-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Instinct Constant Naming
+
+## Action
+
+Name the constant using SCREAMING_SNAKE_CASE
+
+## Evidence
+
+- Pattern in namingConventions.constants: 'SCREAMING_SNAKE_CASE'
+
+---
+id: rmk-cornix-instinct-import-style
+trigger: "When importing modules"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Instinct Import Style
+
+## Action
+
+Use relative import paths
+
+## Evidence
+
+- Pattern in importStyle: 'relative'
+
+---
+id: rmk-cornix-instinct-export-style
+trigger: "When exporting functions or modules"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle: 'named'
+
+---
+id: rmk-cornix-instinct-test-location
+trigger: "When adding or updating tests"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Instinct Test Location
+
+## Action
+
+Place test files in a separate directory from source files
+
+## Evidence
+
+- Pattern in architecture.folderStructure.testLocation: 'separate'
+
+---
+id: rmk-cornix-instinct-git-commit-format
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Instinct Git Commit Format
+
+## Action
+
+Format the commit message as <type>(<scope>): <description>, using 'feat' or 'perf' as type where appropriate
+
+## Evidence
+
+- Pattern in commits.type: 'conventional'
+- Examples: 'feat(led): redesign status light palette', 'perf(firmware): reduce idle power draw'
+
+---
+id: rmk-cornix-instinct-update-status-led-colors
+trigger: "When someone wants to change the status LED color scheme for different profiles or states"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: WangNingkai/rmk-cornix
+---
+
+# Rmk Cornix Instinct Update Status Led Colors
+
+## Action
+
+Edit src/ws2812.rs to change LED color values or logic, then update README.md to reflect the new color palette and document usage
+
+## Evidence
+
+- Workflow: update-status-led-colors
+- Commit sequence: Edit src/ws2812.rs, Update README.md
+
