@@ -45,8 +45,8 @@ active effect is restored automatically.
 | Outer (left) | BLE advertising | Breathes the active profile color for up to 60 seconds |
 | Outer (left) | Caps Lock | Stays amber while Caps Lock is active |
 
-BLE profile colors are low-saturation gem tones: rose (profile 1), emerald
-(profile 2), and sapphire (profile 3).
+BLE profile colors are deep gem tones: amethyst (profile 1), emerald (profile
+2), and sapphire (profile 3).
 
 ## Peripheral (right) half
 
