@@ -37,7 +37,7 @@ use {
     embedded_storage_async::nor_flash::NorFlash as AsyncNorFlash,
 };
 
-use crate::ble::battery_service::BleBatteryServer;
+use crate::ble::battery_service::{BleBatteryServer, BlePeripheralBatteryServer};
 use crate::ble::ble_server::{BleHidServer, Server};
 use crate::ble::device_info::{PnPID, VidSource};
 use crate::ble::led::BleLedReader;
@@ -487,6 +487,7 @@ pub(crate) async fn ble_task<C: Controller + ControllerCmdAsync<LeSetPhy>, P: Pa
 /// This is how we interact with read and write requests.
 async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, DefaultPacketPool>) -> Result<(), Error> {
     let level = server.battery_service.level;
+    let peripheral_level = server.peripheral_battery_service.level;
     let output_keyboard = server.hid_service.output_keyboard;
     let hid_control_point = server.hid_service.hid_control_point;
     let input_keyboard = server.hid_service.input_keyboard;
@@ -566,6 +567,8 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
                             || event.handle() == media.cccd_handle.expect("No CCCD for media report")
                             || event.handle() == system_control.cccd_handle.expect("No CCCD for system report")
                             || event.handle() == battery_level.cccd_handle.expect("No CCCD for battery level")
+                            || event.handle()
+                                == peripheral_level.cccd_handle.expect("No CCCD for peripheral battery level")
                         {
                             // CCCD write event
                             cccd_updated = true;
@@ -870,6 +873,7 @@ async fn run_ble_keyboard<
     let ble_host_server = BleHostServer::new(server, conn);
     let ble_led_reader = BleLedReader {};
     let mut ble_battery_server = BleBatteryServer::new(server, conn);
+    let mut ble_peripheral_battery_server = BlePeripheralBatteryServer::new(server, conn);
 
     // Load CCCD table from storage
     #[cfg(feature = "storage")]
@@ -889,7 +893,10 @@ async fn run_ble_keyboard<
         if let Either3::First(e) = select3(
             gatt_events_task(server, conn),
             set_conn_params(stack, conn),
-            ble_battery_server.run(),
+            join(
+                ble_battery_server.run(),
+                ble_peripheral_battery_server.run(),
+            ),
         )
         .await
         {

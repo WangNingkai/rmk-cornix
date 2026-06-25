@@ -824,6 +824,8 @@ impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_E
                 .fetch_add(1, core::sync::atomic::Ordering::AcqRel)
                 .wrapping_add(1);
             KEY_PRESS_SIGNAL.signal(sequence);
+            #[cfg(feature = "split")]
+            crate::ble::battery_service::PERIPHERAL_BATTERY_KEY_PRESS_SIGNAL.signal(sequence);
         }
 
         #[cfg(feature = "controller")]

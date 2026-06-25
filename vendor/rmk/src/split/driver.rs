@@ -337,7 +337,9 @@ impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFS
                     }
                 }
                 Ok(SplitMessage::Event(event)) => {
-                    if CONNECTION_STATE.load(core::sync::atomic::Ordering::Acquire) {
+                    if let Event::PeripheralBattery(level) = event {
+                        crate::ble::battery_service::update_peripheral_battery(level);
+                    } else if CONNECTION_STATE.load(core::sync::atomic::Ordering::Acquire) {
                         return event;
                     } else {
                         warn!("Event from peripheral is ignored because the connection is not established.");

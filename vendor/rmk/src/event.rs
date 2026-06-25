@@ -24,6 +24,8 @@ pub enum Event {
     AxisEventStream(AxisEvent),
     /// Battery percentage event
     Battery(u16),
+    /// Battery percentage reported by a split peripheral
+    PeripheralBattery(u8),
     /// Charging state changed event, true means charging, false means not charging
     ChargingState(bool),
     /// End of the event sequence

@@ -4,7 +4,7 @@ use ssmarshal::serialize;
 use trouble_host::prelude::*;
 use usbd_hid::descriptor::SerializedDescriptor;
 
-use super::battery_service::BatteryService;
+use super::battery_service::{BatteryService, PeripheralBatteryService};
 use super::device_info::DeviceConfigrmationService;
 #[cfg(feature = "host")]
 use super::host_service::HostService;
@@ -26,6 +26,7 @@ pub(crate) const CCCD_TABLE_SIZE: usize = _CCCD_TABLE_SIZE;
 #[gatt_server]
 pub(crate) struct Server {
     pub(crate) battery_service: BatteryService,
+    pub(crate) peripheral_battery_service: PeripheralBatteryService,
     pub(crate) hid_service: HidService,
     pub(crate) host_service: HostService,
     pub(crate) composite_service: CompositeService,
@@ -36,6 +37,7 @@ pub(crate) struct Server {
 #[gatt_server]
 pub(crate) struct Server {
     pub(crate) battery_service: BatteryService,
+    pub(crate) peripheral_battery_service: PeripheralBatteryService,
     pub(crate) hid_service: HidService,
     pub(crate) composite_service: CompositeService,
     pub(crate) device_config_service: DeviceConfigrmationService,

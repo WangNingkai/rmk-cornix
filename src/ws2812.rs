@@ -3,10 +3,10 @@ use embassy_nrf::pwm::{SequenceConfig, SequencePwm, SingleSequenceMode, SingleSe
 use embassy_nrf::saadc::Saadc;
 use embassy_time::{Duration, Instant, Timer};
 use rmk::ble::BleState;
-use rmk::channel::{ControllerSub, CONTROLLER_CHANNEL};
+use rmk::channel::{ControllerSub, CONTROLLER_CHANNEL, EVENT_CHANNEL};
 use rmk::controller::{Controller, PollingController};
 use rmk::embassy_futures::select::{select, Either};
-use rmk::event::ControllerEvent;
+use rmk::event::{ControllerEvent, Event};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -397,7 +397,11 @@ impl Ws2812Indicator {
 
         let mut buf = [0i16; 1];
         battery_adc.sample(&mut buf).await;
-        self.set_battery_level(Self::battery_percent_from_adc(buf[0]));
+        let level = Self::battery_percent_from_adc(buf[0]);
+        self.set_battery_level(level);
+        if self.role == Role::Peripheral {
+            let _ = EVENT_CHANNEL.try_send(Event::PeripheralBattery(level));
+        }
     }
 
     /// Schedule the low-battery alert: blink for `LOW_ALERT`, stay quiet for

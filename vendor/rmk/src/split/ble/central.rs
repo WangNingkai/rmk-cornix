@@ -451,6 +451,7 @@ impl<'a, 'b, 'c, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool> Sp
                 update_activity_time();
             }
             SplitMessage::Event(crate::event::Event::Battery(_))
+            | SplitMessage::Event(crate::event::Event::PeripheralBattery(_))
             | SplitMessage::Event(crate::event::Event::ChargingState(_)) => {}
             SplitMessage::Event(_) => {
                 debug!("Non-key event activity detected from peripheral");

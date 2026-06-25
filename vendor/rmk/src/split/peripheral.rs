@@ -140,7 +140,9 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                     }
                 }
                 embassy_futures::select::Either3::Third(e) => {
-                    if CONNECTION_STATE.load(core::sync::atomic::Ordering::Acquire) {
+                    if matches!(e, crate::event::Event::PeripheralBattery(_))
+                        || CONNECTION_STATE.load(core::sync::atomic::Ordering::Acquire)
+                    {
                         debug!("Writing split event to central: {:?}", e);
                         self.split_driver.write(&SplitMessage::Event(e)).await.ok();
                     } else {
