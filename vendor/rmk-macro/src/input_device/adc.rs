@@ -14,7 +14,7 @@ pub(crate) fn expand_adc_device(
         ChipSeries::Nrf52 => {
             let mut channel_cfg = vec![];
             let mut adc_type = vec![];
-            let mut default_polling_interval = 30000u16; // default 30s
+            let mut default_polling_interval = 300_000u32; // default 5min
             let mut light_sleep: Option<u16> = None;
             // TODO: deep sleep
 

@@ -9,7 +9,7 @@ chip = "nrf52840"
 [ble]
 enabled = true
 ble_use_2m_phy = true
-default_tx_power = 8
+default_tx_power = 0
 battery_adc_pin = "P0_05"
 adc_divider_measured = 2000
 adc_divider_total = 2806
@@ -55,7 +55,7 @@ internal_pullup = true
 split_peripherals_num = 1
 debounce_time = 5
 ble_profiles_num = 5
-split_central_sleep_timeout_seconds = 300
+split_central_sleep_timeout_seconds = 120
 morse_max_num = 32
 max_patterns_per_key = 8
 combo_max_num = 32

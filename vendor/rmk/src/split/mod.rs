@@ -42,4 +42,6 @@ pub(crate) enum SplitMessage {
     Bootloader,
     /// Reboot the peripheral
     Reboot,
+    /// The central idle state, used to suspend peripheral status polling.
+    Sleep(bool),
 }

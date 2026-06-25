@@ -91,6 +91,10 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                             trace!("Received connection state update: {}", state);
                             CONNECTION_STATE.store(state, core::sync::atomic::Ordering::Release);
                         }
+                        SplitMessage::Sleep(sleeping) => {
+                            #[cfg(feature = "controller")]
+                            send_controller_event(&mut controller_pub, ControllerEvent::Sleep(sleeping));
+                        }
                         #[cfg(all(feature = "_ble", feature = "storage"))]
                         SplitMessage::ClearPeer => {
                             // Clear the peer address

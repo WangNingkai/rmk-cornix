@@ -25,7 +25,7 @@ const NOTICE: Duration = Duration::from_secs(3);
 const ACTIVITY: Duration = Duration::from_secs(60);
 const LOW_ALERT: Duration = Duration::from_secs(5);
 const LOW_QUIET: Duration = Duration::from_secs(5 * 60);
-const BATTERY_SAMPLE: Duration = Duration::from_secs(30);
+const BATTERY_SAMPLE: Duration = Duration::from_secs(5 * 60);
 
 // Per-frame easing step toward the target color (~200 ms full fade at 30 fps).
 const FADE_STEP: u8 = 3;
@@ -570,6 +570,24 @@ impl PollingController for Ws2812Indicator {
     async fn polling_loop(&mut self) {
         let mut deadline = Instant::now();
         loop {
+            // When sleeping and fully settled (LEDs off), suspend periodic
+            // polling entirely — just wait for controller events.  This keeps
+            // the CPU in WFE between BLE connection events and eliminates the
+            // 1-second idle tick that was waking it for no reason.
+            if self.sleeping && !self.pending && !self.is_animating() {
+                loop {
+                    let event = self.next_message().await;
+                    self.process_event(event).await;
+                    if self.pending {
+                        break;
+                    }
+                }
+                // A state-changing event arrived; resume the normal loop so
+                // `update()` can react (e.g. fade-in on wake, show charging).
+                deadline = Instant::now();
+                continue;
+            }
+
             let now = Instant::now();
             if now >= deadline {
                 self.update().await;

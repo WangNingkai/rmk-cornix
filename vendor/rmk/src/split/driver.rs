@@ -13,6 +13,9 @@ use crate::channel::{CONTROLLER_CHANNEL, EVENT_CHANNEL, KEY_EVENT_CHANNEL};
 use crate::event::{ControllerEvent, Event, KeyboardEvent, KeyboardEventPos};
 use crate::input_device::InputDevice;
 
+const CONNECTION_STATE_CHECK_INTERVAL_MS: u64 = 1_000;
+const STATE_SYNC_INTERVAL_MS: u64 = 60_000;
+
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(crate) enum SplitDriverError {
@@ -99,7 +102,8 @@ impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFS
     /// Run the manager.
     ///
     /// The manager receives from the peripheral and forward the message to `KEY_EVENT_CHANNEL`.
-    /// It also sync the `ConnectionState` to the peripheral periodically.
+    /// It also syncs `ConnectionState` changes to the peripheral, with a slow
+    /// periodic fallback in case a state-change event is missed.
     pub(crate) async fn run(mut self) {
         let mut conn_state = CONNECTION_STATE.load(Ordering::Acquire);
         // Send connection state once on start
@@ -109,18 +113,77 @@ impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFS
                 _ => error!("SplitDriver write error: {:?}", e),
             }
         }
+        #[cfg(feature = "_ble")]
+        if let Err(e) = self
+            .transceiver
+            .write(&SplitMessage::Sleep(
+                crate::ble::SLEEPING_STATE.load(Ordering::Acquire),
+            ))
+            .await
+        {
+            match e {
+                SplitDriverError::Disconnected => return,
+                _ => error!("SplitDriver write error: {:?}", e),
+            }
+        }
 
-        let mut last_sync_time = Instant::now();
+        let mut last_state_check_time = Instant::now();
+        let mut last_sync_time = last_state_check_time;
         let mut subscriber = CONTROLLER_CHANNEL
             .subscriber()
             .expect("Failed to create split message subscriber: MaximumSubscribersReached");
 
         loop {
-            // Calculate the time until the next 3000ms sync
-            let elapsed = last_sync_time.elapsed().as_millis();
-            let wait_time = if elapsed >= 3000 { 1 } else { 3000 - elapsed };
+            // Check the local atomic state frequently without radio traffic;
+            // the slower timer is only a BLE fallback sync.
+            let check_elapsed = last_state_check_time.elapsed().as_millis();
+            let sync_elapsed = last_sync_time.elapsed().as_millis();
+            if check_elapsed >= CONNECTION_STATE_CHECK_INTERVAL_MS || sync_elapsed >= STATE_SYNC_INTERVAL_MS {
+                let current_conn_state = CONNECTION_STATE.load(Ordering::Acquire);
+                last_state_check_time = Instant::now();
 
-            // Read the message from peripheral, or sync the connection state every 1000ms.
+                if current_conn_state != conn_state {
+                    conn_state = current_conn_state;
+                    trace!("Connection state changed: {}", conn_state);
+                    if let Err(e) = self.transceiver.write(&SplitMessage::ConnectionState(conn_state)).await {
+                        match e {
+                            SplitDriverError::Disconnected => return,
+                            _ => error!("SplitDriver write error: {:?}", e),
+                        }
+                    }
+                    last_sync_time = last_state_check_time;
+                } else if sync_elapsed >= STATE_SYNC_INTERVAL_MS {
+                    trace!("Fallback state sync to peripheral: {}", conn_state);
+                    if let Err(e) = self.transceiver.write(&SplitMessage::ConnectionState(conn_state)).await {
+                        match e {
+                            SplitDriverError::Disconnected => return,
+                            _ => error!("SplitDriver write error: {:?}", e),
+                        }
+                    }
+                    #[cfg(feature = "_ble")]
+                    if let Err(e) = self
+                        .transceiver
+                        .write(&SplitMessage::Sleep(
+                            crate::ble::SLEEPING_STATE.load(Ordering::Acquire),
+                        ))
+                        .await
+                    {
+                        match e {
+                            SplitDriverError::Disconnected => return,
+                            _ => error!("SplitDriver write error: {:?}", e),
+                        }
+                    }
+                    last_sync_time = Instant::now();
+                }
+                continue;
+            }
+
+            let check_wait = CONNECTION_STATE_CHECK_INTERVAL_MS.saturating_sub(check_elapsed);
+            let sync_wait = STATE_SYNC_INTERVAL_MS.saturating_sub(sync_elapsed);
+            let wait_time = check_wait.min(sync_wait).max(1);
+
+            // Read messages, react to controller events, or perform a slow
+            // fallback sync.
             match select3(
                 self.read_event(),
                 subscriber.next_message_pure(),
@@ -187,6 +250,14 @@ impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFS
                                 }
                             }
                         }
+                        ControllerEvent::Sleep(sleeping) => {
+                            if let Err(e) = self.transceiver.write(&SplitMessage::Sleep(sleeping)).await {
+                                match e {
+                                    SplitDriverError::Disconnected => return,
+                                    _ => error!("SplitDriver write error: {:?}", e),
+                                }
+                            }
+                        }
                         ControllerEvent::Bootloader(event) if Self::contains_key_event(event) => {
                             self.release_all_keys().await;
                             if let Err(e) = self.transceiver.write(&SplitMessage::Bootloader).await {
@@ -207,19 +278,21 @@ impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFS
                         }
                         _ => {}
                     }
-                }
-                Either3::Third(_) => {
-                    // Timer elapsed, sync the connection state
-                    conn_state = CONNECTION_STATE.load(Ordering::Acquire);
-                    trace!("Syncing connection state to peripheral: {}", conn_state);
-                    if let Err(e) = self.transceiver.write(&SplitMessage::ConnectionState(conn_state)).await {
-                        match e {
-                            SplitDriverError::Disconnected => return,
-                            _ => error!("SplitDriver write error: {:?}", e),
+
+                    let current_conn_state = CONNECTION_STATE.load(Ordering::Acquire);
+                    if current_conn_state != conn_state {
+                        conn_state = current_conn_state;
+                        trace!("Connection state changed: {}", conn_state);
+                        if let Err(e) = self.transceiver.write(&SplitMessage::ConnectionState(conn_state)).await {
+                            match e {
+                                SplitDriverError::Disconnected => return,
+                                _ => error!("SplitDriver write error: {:?}", e),
+                            }
                         }
+                        last_sync_time = Instant::now();
                     }
-                    last_sync_time = Instant::now();
                 }
+                Either3::Third(_) => {}
             }
         }
     }
