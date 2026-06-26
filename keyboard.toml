@@ -107,7 +107,9 @@ timeout = "50ms"
 combos = []
 
 [behavior.morse]
-enable_flow_tap = false
-hold_on_other_press = true
-hold_timeout = "250ms"
-gap_timeout = "250ms"
+enable_flow_tap = true
+permissive_hold = true
+unilateral_tap = true
+prior_idle_time = "120ms"
+hold_timeout = "200ms"
+gap_timeout = "200ms"

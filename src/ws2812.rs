@@ -246,11 +246,6 @@ impl Ws2812Indicator {
 
     fn set_sleeping(&mut self, sleeping: bool) {
         if self.sleeping != sleeping {
-            if !sleeping {
-                // Re-show the connection/peer notices when waking up.
-                self.ble_since = Instant::now();
-                self.peer_since = Instant::now();
-            }
             self.sleeping = sleeping;
             self.pending = true;
         }
