@@ -2,6 +2,7 @@
 *.hex
 *.uf2
 *.vil
+.zed/
 
 # Generated or registry-only files inside vendored Rust crates
 /vendor/**/target/
