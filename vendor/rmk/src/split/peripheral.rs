@@ -134,7 +134,10 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                     // Only send the key event if the connection is established
                     if CONNECTION_STATE.load(core::sync::atomic::Ordering::Acquire) {
                         debug!("Writing split key event to central");
-                        self.split_driver.write(&SplitMessage::Key(e)).await.ok();
+                        if let Err(err) = self.split_driver.write(&SplitMessage::Key(e)).await {
+                            error!("Split key write error, reconnecting: {:?}", err);
+                            break;
+                        }
                     } else {
                         debug!("Connection not established, skipping key event");
                     }
@@ -144,7 +147,10 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                         || CONNECTION_STATE.load(core::sync::atomic::Ordering::Acquire)
                     {
                         debug!("Writing split event to central: {:?}", e);
-                        self.split_driver.write(&SplitMessage::Event(e)).await.ok();
+                        if let Err(err) = self.split_driver.write(&SplitMessage::Event(e)).await {
+                            error!("Split event write error, reconnecting: {:?}", err);
+                            break;
+                        }
                     } else {
                         debug!("Connection not established, skipping event");
                     }

@@ -2438,29 +2438,28 @@ mod test {
 
     #[rustfmt::skip]
     fn get_combos_config() -> CombosConfig {
-        // Define the function to return the appropriate combo configuration
-        CombosConfig {
-            combos: [
-                Some(Combo::new(ComboConfig {
-                    actions: [
-                        k!(V), //3,4
-                        k!(B), //3,5
-                        k!(No), k!(No),
-                    ],
-                    output: k!(LShift),
-                    layer: Some(0),
-                })),
-                Some(Combo::new(ComboConfig {
-                    actions: [
-                        k!(R), //1,4
-                        k!(T), //1,5
-                        k!(No), k!(No),
-                    ],
-                    output: k!(LAlt),
-                    layer: Some(0),
-                })),
-                None, None, None, None, None, None
+        let mut combos = [const { None }; crate::COMBO_MAX_NUM];
+        combos[0] = Some(Combo::new(ComboConfig {
+            actions: [
+                k!(V), //3,4
+                k!(B), //3,5
+                k!(No), k!(No),
             ],
+            output: k!(LShift),
+            layer: Some(0),
+        }));
+        combos[1] = Some(Combo::new(ComboConfig {
+            actions: [
+                k!(R), //1,4
+                k!(T), //1,5
+                k!(No), k!(No),
+            ],
+            output: k!(LAlt),
+            layer: Some(0),
+        }));
+
+        CombosConfig {
+            combos,
             timeout: Duration::from_millis(100),
         }
     }

@@ -298,6 +298,31 @@ impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFS
     }
 }
 
+impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFSET: usize, T: SplitReader + SplitWriter>
+    Drop for PeripheralManager<ROW, COL, ROW_OFFSET, COL_OFFSET, T>
+{
+    fn drop(&mut self) {
+        for row in 0..ROW {
+            for col in 0..COL {
+                if self.pressed_keys[row][col] {
+                    let event = KeyboardEvent::key(
+                        (row + ROW_OFFSET) as u8,
+                        (col + COL_OFFSET) as u8,
+                        false,
+                    );
+                    if KEY_EVENT_CHANNEL.try_send(event).is_err() {
+                        warn!(
+                            "Failed to release peripheral key on disconnect: {} {}",
+                            row + ROW_OFFSET,
+                            col + COL_OFFSET
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFSET: usize, R: SplitReader + SplitWriter>
     InputDevice for PeripheralManager<ROW, COL, ROW_OFFSET, COL_OFFSET, R>
 {
@@ -354,5 +379,39 @@ impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFS
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDriver;
+
+    impl SplitReader for TestDriver {
+        async fn read(&mut self) -> Result<SplitMessage, SplitDriverError> {
+            panic!("test driver must not read")
+        }
+    }
+
+    impl SplitWriter for TestDriver {
+        async fn write(&mut self, _message: &SplitMessage) -> Result<usize, SplitDriverError> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn dropping_manager_releases_pressed_peripheral_keys() {
+        KEY_EVENT_CHANNEL.clear();
+
+        let mut manager = PeripheralManager::<1, 1, 4, 2, _>::new(TestDriver, 0);
+        manager.pressed_keys[0][0] = true;
+        drop(manager);
+
+        assert_eq!(
+            KEY_EVENT_CHANNEL.try_receive().unwrap(),
+            KeyboardEvent::key(4, 2, false)
+        );
+        assert!(KEY_EVENT_CHANNEL.try_receive().is_err());
     }
 }

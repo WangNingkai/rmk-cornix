@@ -20,7 +20,7 @@ own RMK firmware for Cornix, not to replicate the official firmware.
 - Full RGB lighting effects are not supported. The onboard LEDs are used only as
   short status indicators.
 - BLE is configured for balanced daily use: 2M PHY, +8 dBm TX power, and split
-  central sleep after 5 minutes of inactivity.
+  central sleep after 2 minutes of inactivity.
 - Status LEDs use an adaptive refresh: they run smooth, gamma-corrected
   breathing with soft fade in/out while active, and drop to a slow idle tick
   once an effect becomes static or turns off, so idle wakeups stay low.
@@ -46,7 +46,7 @@ active effect is restored automatically.
 | Outer (left) | Caps Lock | Stays amber while Caps Lock is active |
 
 BLE profile colors are deep gem tones: amethyst (profile 1), emerald (profile
-2), and sapphire (profile 3).
+2), sapphire (profile 3), garnet (profile 4), and turquoise (profile 5).
 
 ## Peripheral (right) half
 
@@ -59,7 +59,7 @@ BLE profile colors are deep gem tones: amethyst (profile 1), emerald (profile
 Both LEDs fade smoothly between states and turn off while the keyboard is
 sleeping. Animated effects and fades update every 33 ms; settled solid colors
 and off states use a 1-second idle tick. State-change events still trigger a
-prompt update. Battery voltage is sampled every 30 seconds where an ADC is
+prompt update. Battery voltage is sampled every 5 minutes where an ADC is
 available, and the LED power rail is shut down after both LEDs fade fully to
 black.
 

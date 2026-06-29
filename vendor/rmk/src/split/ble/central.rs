@@ -319,7 +319,7 @@ async fn run_central_manager_task<
 
     match select3(
         ble_central_task(&client, conn),
-        run_peripheral_manager::<_, _, ROW, COL, ROW_OFFSET, COL_OFFSET>(id, &client),
+        run_peripheral_manager::<_, _, ROW, COL, ROW_OFFSET, COL_OFFSET>(id, &client, conn),
         sleep_manager_task(stack, conn),
     )
     .await
@@ -361,6 +361,7 @@ async fn run_peripheral_manager<
 >(
     id: usize,
     client: &GattClient<'a, C, P, 10>,
+    conn: &Connection<'a, P>,
 ) -> Result<(), BleHostError<C::Error>> {
     let services = client
         .services_by_uuid(&Uuid::new_long([
@@ -392,7 +393,7 @@ async fn run_peripheral_manager<
             .await?;
         info!("Subscribing notifications");
         let listener = client.subscribe(&message_to_central, false).await?;
-        let split_ble_driver = BleSplitCentralDriver::new(listener, message_to_peripheral, client);
+        let split_ble_driver = BleSplitCentralDriver::new(listener, message_to_peripheral, client, conn);
         let peripheral_manager = PeripheralManager::<ROW, COL, ROW_OFFSET, COL_OFFSET, _>::new(split_ble_driver, id);
         peripheral_manager.run().await;
         info!("Peripheral manager stopped");
@@ -413,6 +414,8 @@ pub(crate) struct BleSplitCentralDriver<'a, 'b, 'c, C: Controller + ControllerCm
     message_to_peripheral: Characteristic<[u8; SPLIT_MESSAGE_MAX_SIZE]>,
     // Client
     client: &'c GattClient<'a, C, P, 10>,
+    // Connection used to tear down a stalled ATT transaction before retrying.
+    conn: &'c Connection<'a, P>,
     // Cached connection state
     connection_state: bool,
 }
@@ -422,11 +425,13 @@ impl<'a, 'b, 'c, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool> Bl
         listener: NotificationListener<'b, 512>,
         message_to_peripheral: Characteristic<[u8; SPLIT_MESSAGE_MAX_SIZE]>,
         client: &'c GattClient<'a, C, P, 10>,
+        conn: &'c Connection<'a, P>,
     ) -> Self {
         Self {
             listener,
             message_to_peripheral,
             client,
+            conn,
             connection_state: CONNECTION_STATE.load(Ordering::Acquire),
         }
     }
@@ -492,10 +497,12 @@ impl<'a, 'b, 'c, C: Controller + ControllerCmdAsync<LeSetPhy>, P: PacketPool> Sp
                 #[cfg(feature = "defmt")]
                 let e = defmt::Debug2Format(&e);
                 error!("BLE message_to_peripheral_write error, reconnecting: {:?}", e);
+                self.conn.disconnect();
                 return Err(SplitDriverError::Disconnected);
             }
             Err(_) => {
                 error!("BLE message_to_peripheral_write timeout, reconnecting");
+                self.conn.disconnect();
                 return Err(SplitDriverError::Disconnected);
             }
         }
