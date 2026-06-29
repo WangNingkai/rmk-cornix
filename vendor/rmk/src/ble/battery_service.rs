@@ -1,4 +1,4 @@
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use embassy_sync::signal::Signal;
 use embassy_time::Timer;
@@ -10,6 +10,7 @@ use crate::keyboard::{KEY_PRESS_SEQUENCE, KEY_PRESS_SIGNAL};
 
 pub(crate) static PERIPHERAL_BATTERY_UPDATE: Signal<crate::RawMutex, BatteryUpdate> = Signal::new();
 pub(crate) static PERIPHERAL_BATTERY_KEY_PRESS_SIGNAL: Signal<crate::RawMutex, u32> = Signal::new();
+static PERIPHERAL_BATTERY_LEVEL: AtomicU8 = AtomicU8::new(u8::MAX);
 
 /// Battery service
 #[gatt_service(uuid = service::BATTERY)]
@@ -35,10 +36,16 @@ pub(crate) struct PeripheralBatteryService {
 }
 
 pub(crate) fn update_peripheral_battery(level: u8) {
+    PERIPHERAL_BATTERY_LEVEL.store(level, Ordering::Release);
     PERIPHERAL_BATTERY_UPDATE.signal(BatteryUpdate {
         state: BatteryState::Normal(level),
         key_press_sequence: KEY_PRESS_SEQUENCE.load(Ordering::Acquire),
     });
+}
+
+pub(crate) fn peripheral_battery_level() -> Option<u8> {
+    let level = PERIPHERAL_BATTERY_LEVEL.load(Ordering::Acquire);
+    (level <= 100).then_some(level)
 }
 
 pub(crate) struct BleBatteryServer<'stack, 'server, 'conn, P: PacketPool> {
@@ -71,13 +78,26 @@ impl<'stack, 'server, 'conn, P: PacketPool> BlePeripheralBatteryServer<'stack, '
 
 impl<P: PacketPool> BlePeripheralBatteryServer<'_, '_, '_, P> {
     pub(crate) async fn run(&mut self) {
+        // A host reconnect creates a fresh notification task, while the right
+        // half may not sample again for several minutes. Replay its last known
+        // level after the next key press instead of leaving the new connection
+        // at the characteristic's default value (0%).
+        let cached_level = PERIPHERAL_BATTERY_LEVEL.load(Ordering::Acquire);
+        let mut cached_update = (cached_level <= 100).then_some(BatteryUpdate {
+            state: BatteryState::Normal(cached_level),
+            key_press_sequence: KEY_PRESS_SEQUENCE.load(Ordering::Acquire),
+        });
+
         Timer::after_secs(2).await;
 
         loop {
             let BatteryUpdate {
                 state,
                 key_press_sequence: battery_sequence,
-            } = PERIPHERAL_BATTERY_UPDATE.wait().await;
+            } = match cached_update.take() {
+                Some(update) => update,
+                None => PERIPHERAL_BATTERY_UPDATE.wait().await,
+            };
             wait_for_key_press_after(battery_sequence, &PERIPHERAL_BATTERY_KEY_PRESS_SIGNAL).await;
 
             if let BatteryState::Normal(level) = state

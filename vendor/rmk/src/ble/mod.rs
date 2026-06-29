@@ -543,6 +543,16 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
                         if event.handle() == level.handle {
                             let value = server.get(&level);
                             debug!("Read GATT Event to Level: {:?}", value);
+                        } else if event.handle() == peripheral_level.handle {
+                            // A read is initiated by the host, so refreshing
+                            // the table here cannot wake it unexpectedly.
+                            if let Some(value) = battery_service::peripheral_battery_level() {
+                                if let Err(e) = server.set(&peripheral_level, &value) {
+                                    warn!("Failed to refresh peripheral battery level: {:?}", e);
+                                }
+                            }
+                            let value = server.get(&peripheral_level);
+                            debug!("Read GATT Event to Peripheral Level: {:?}", value);
                         } else {
                             debug!("Read GATT Event to Unknown: {:?}", event.handle());
                         }

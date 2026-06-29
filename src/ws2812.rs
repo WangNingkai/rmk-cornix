@@ -109,7 +109,11 @@ const AMETHYST: Grb = Grb { g: 4, r: 14, b: 22 };
 const EMERALD: Grb = Grb { g: 14, r: 3, b: 5 };
 const SAPPHIRE: Grb = Grb { g: 3, r: 2, b: 22 };
 const GARNET: Grb = Grb { g: 2, r: 20, b: 4 };
-const TURQUOISE: Grb = Grb { g: 14, r: 0, b: 12 };
+const DIAMOND: Grb = Grb {
+    g: 12,
+    r: 20,
+    b: 16,
+};
 
 pub struct Ws2812Indicator {
     pwm: SequencePwm<'static>,
@@ -259,7 +263,7 @@ impl Ws2812Indicator {
             1 => EMERALD,
             2 => SAPPHIRE,
             3 => GARNET,
-            _ => TURQUOISE,
+            _ => DIAMOND,
         }
     }
 
@@ -514,6 +518,13 @@ impl Controller for Ws2812Indicator {
             }
             ControllerEvent::SplitCentral(connected) if self.role == Role::Peripheral => {
                 self.set_peer_connected(connected);
+                if connected {
+                    // SplitCentral(true) is sent again after the central has
+                    // subscribed to split notifications. Sample on that ready
+                    // signal so a pre-subscription report cannot be lost.
+                    self.last_battery_sample = None;
+                    self.pending = true;
+                }
             }
             ControllerEvent::BleState(profile, state) if self.role == Role::Central => {
                 self.set_ble_state(profile, state);

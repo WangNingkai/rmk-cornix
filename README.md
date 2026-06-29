@@ -46,7 +46,7 @@ active effect is restored automatically.
 | Outer (left) | Caps Lock | Stays amber while Caps Lock is active |
 
 BLE profile colors are deep gem tones: amethyst (profile 1), emerald (profile
-2), sapphire (profile 3), garnet (profile 4), and turquoise (profile 5).
+2), sapphire (profile 3), garnet (profile 4), and diamond (profile 5).
 
 ## Peripheral (right) half
 

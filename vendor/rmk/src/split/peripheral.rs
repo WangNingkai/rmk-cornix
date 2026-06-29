@@ -75,6 +75,8 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
 
         #[cfg(feature = "controller")]
         let mut controller_pub = unwrap!(CONTROLLER_CHANNEL.publisher());
+        #[cfg(feature = "controller")]
+        let mut central_ready = false;
 
         loop {
             match select3(
@@ -90,6 +92,14 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                         SplitMessage::ConnectionState(state) => {
                             trace!("Received connection state update: {}", state);
                             CONNECTION_STATE.store(state, core::sync::atomic::Ordering::Release);
+                            #[cfg(feature = "controller")]
+                            if !central_ready {
+                                // The central sends its first state only after
+                                // subscribing to split notifications. Expose
+                                // that transport-ready point to controllers.
+                                central_ready = true;
+                                send_controller_event(&mut controller_pub, ControllerEvent::SplitCentral(true));
+                            }
                         }
                         SplitMessage::Sleep(sleeping) => {
                             #[cfg(feature = "controller")]
