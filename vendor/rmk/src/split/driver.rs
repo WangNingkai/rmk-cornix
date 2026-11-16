@@ -1,20 +1,20 @@
 //! The abstracted driver layer of the split keyboard.
 //!
-use core::sync::atomic::Ordering;
+use core::cell::Cell;
 
-use embassy_futures::select::{Either3, select3};
-use embassy_time::{Instant, Timer};
-#[cfg(all(feature = "storage", feature = "_ble"))]
-use {crate::channel::FLASH_CHANNEL, crate::split::ble::PeerAddress, crate::storage::FlashOperationMessage};
+use embassy_futures::select::{Either, select};
+use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+use futures::FutureExt;
+use rmk_types::battery::BatteryStatus;
+#[cfg(feature = "rynk")]
+use rmk_types::protocol::rynk::PeripheralStatus;
 
-use super::SplitMessage;
-use crate::CONNECTION_STATE;
-use crate::channel::{CONTROLLER_CHANNEL, EVENT_CHANNEL, KEY_EVENT_CHANNEL};
-use crate::event::{ControllerEvent, Event, KeyboardEvent, KeyboardEventPos};
-use crate::input_device::InputDevice;
-
-const CONNECTION_STATE_CHECK_INTERVAL_MS: u64 = 1_000;
-const STATE_SYNC_INTERVAL_MS: u64 = 60_000;
+use super::{PeripheralMatrixConfig, SplitMessage};
+#[cfg(feature = "_ble")]
+use crate::event::{BatteryStatusEvent, PeripheralBatteryEvent};
+use crate::event::{
+    KeyboardEvent, KeyboardEventPos, PeripheralConnectedEvent, SubscribableEvent, publish_event, publish_event_async,
+};
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -37,381 +37,882 @@ pub(crate) trait SplitWriter {
     async fn write(&mut self, message: &SplitMessage) -> Result<usize, SplitDriverError>;
 }
 
+/// Live per-peripheral status. Latched here in the transport-agnostic split
+/// layer so host services can read a current snapshot at any time, even when
+/// no host session was active when the change happened. Wired peripherals
+/// never report a battery, so theirs stays `Unavailable`.
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct PeripheralSlot {
+    connected: bool,
+    battery: BatteryStatus,
+}
+
+static PERIPHERAL_SLOTS: BlockingMutex<crate::RawMutex, Cell<[PeripheralSlot; crate::SPLIT_PERIPHERALS_NUM]>> =
+    BlockingMutex::new(Cell::new(
+        [PeripheralSlot {
+            connected: false,
+            battery: BatteryStatus::Unavailable,
+        }; crate::SPLIT_PERIPHERALS_NUM],
+    ));
+
+/// Read-modify-write peripheral `id`'s slot. Returns `false` when `id` is out
+/// of range or the slot didn't change, so callers skip publishing.
+fn update_slot(id: usize, f: impl FnOnce(&mut PeripheralSlot)) -> bool {
+    PERIPHERAL_SLOTS.lock(|slots| {
+        let mut all = slots.get();
+        let Some(slot) = all.get_mut(id) else {
+            return false;
+        };
+        let prev = *slot;
+        f(slot);
+        if *slot == prev {
+            return false;
+        }
+        slots.set(all);
+        true
+    })
+}
+
+/// Latch peripheral `id`'s connected state and broadcast the change.
+pub(crate) fn set_peripheral_connected(id: usize, connected: bool) {
+    if update_slot(id, |s| s.connected = connected) {
+        publish_event(PeripheralConnectedEvent { id, connected });
+    }
+}
+
+/// Latch peripheral `id`'s battery status and broadcast the change.
+#[cfg(feature = "_ble")]
+pub(crate) fn set_peripheral_battery(id: usize, battery: BatteryStatus) {
+    if update_slot(id, |s| s.battery = battery) {
+        publish_event(PeripheralBatteryEvent {
+            id,
+            state: BatteryStatusEvent(battery),
+        });
+    }
+}
+
+/// Latest battery status reported by peripheral `id`.
+#[cfg(feature = "_ble")]
+pub(crate) fn current_peripheral_battery_status(id: usize) -> Option<BatteryStatus> {
+    PERIPHERAL_SLOTS.lock(|slots| slots.get().get(id).map(|slot| slot.battery))
+}
+
+/// Latest snapshot for peripheral `id`, or `None` when `id` is out of range.
+#[cfg(feature = "rynk")]
+pub(crate) fn current_peripheral_status(id: usize) -> Option<PeripheralStatus> {
+    PERIPHERAL_SLOTS.lock(|slots| {
+        slots.get().get(id).map(|s| PeripheralStatus {
+            connected: s.connected,
+            battery: s.battery,
+        })
+    })
+}
+
+#[cfg(all(test, feature = "_ble"))]
+mod tests {
+    use rmk_types::battery::ChargeState;
+
+    use super::{current_peripheral_battery_status, set_peripheral_battery};
+
+    #[test]
+    fn caches_latest_peripheral_battery_status() {
+        let status = rmk_types::battery::BatteryStatus::Available {
+            charge_state: ChargeState::Discharging,
+            level: Some(73),
+        };
+
+        set_peripheral_battery(0, status);
+
+        assert_eq!(current_peripheral_battery_status(0), Some(status));
+        assert_eq!(current_peripheral_battery_status(crate::SPLIT_PERIPHERALS_NUM), None);
+    }
+}
+
+/// 按键状态由连接任务持有，避免分体读取任务取消时丢失待释放按键。
+pub(crate) struct PeripheralKeyState {
+    matrix_config: PeripheralMatrixConfig,
+    // shortcut: 最多跟踪 64 个同时按下的位置，更大分体矩阵需提高容量。
+    pressed_keys: heapless::Vec<crate::event::KeyPos, 64>,
+}
+
+impl PeripheralKeyState {
+    pub(crate) fn new(matrix_config: PeripheralMatrixConfig) -> Self {
+        assert!(usize::from(matrix_config.rows) * usize::from(matrix_config.cols) <= 64);
+        Self {
+            matrix_config,
+            pressed_keys: heapless::Vec::new(),
+        }
+    }
+
+    pub(crate) async fn release_all(&mut self) {
+        while let Some(pos) = self.pressed_keys.last().copied() {
+            // 等待队列空位，不能覆盖另一半尚未处理的松开事件。
+            publish_event_async(KeyboardEvent::key(
+                pos.row + self.matrix_config.row_offset,
+                pos.col + self.matrix_config.col_offset,
+                false,
+            ))
+            .await;
+            self.pressed_keys.pop();
+        }
+    }
+}
+
 /// PeripheralManager runs in central.
 /// It reads split message from peripheral and updates key matrix cache of the peripheral.
 ///
 /// When the central scans the matrix, the scanning thread sends sync signal and gets key state cache back.
 ///
-/// The `ROW` and `COL` are the number of rows and columns of the corresponding peripheral's keyboard matrix.
-/// The `ROW_OFFSET` and `COL_OFFSET` are the offset of the peripheral's matrix in the keyboard's matrix.
-pub(crate) struct PeripheralManager<
-    const ROW: usize,
-    const COL: usize,
-    const ROW_OFFSET: usize,
-    const COL_OFFSET: usize,
-    T: SplitReader + SplitWriter,
-> {
+pub(crate) struct PeripheralManager<'a, T: SplitReader + SplitWriter> {
     /// Receiver
     transceiver: T,
     /// Peripheral id
     id: usize,
-    /// Keys currently held on this peripheral
-    pressed_keys: [[bool; COL]; ROW],
+    keys: &'a mut PeripheralKeyState,
+    #[cfg(feature = "dfu_split")]
+    passthrough_crc: crate::crc32::Crc32,
+    /// Whether to skip hash comparison and always flash firmware.
+    #[cfg(feature = "dfu_split")]
+    policy: UpdatePolicy,
 }
 
-impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFSET: usize, T: SplitReader + SplitWriter>
-    PeripheralManager<ROW, COL, ROW_OFFSET, COL_OFFSET, T>
-{
-    pub(crate) fn new(transceiver: T, id: usize) -> Self {
+/// Defines how the central decides whether to flash a peripheral.
+#[cfg(feature = "dfu_split")]
+#[derive(Clone, Copy)]
+pub enum UpdatePolicy {
+    /// Compare the firmware hash — only flash when it differs.
+    MatchHash,
+    /// Always flash the firmware regardless of the current version.
+    Force,
+}
+
+impl<'a, T: SplitReader + SplitWriter> PeripheralManager<'a, T> {
+    pub(crate) fn new(
+        transceiver: T,
+        id: usize,
+        keys: &'a mut PeripheralKeyState,
+        #[cfg(feature = "dfu_split")] policy: UpdatePolicy,
+    ) -> Self {
         Self {
             transceiver,
+            keys,
             id,
-            pressed_keys: [[false; COL]; ROW],
+            #[cfg(feature = "dfu_split")]
+            passthrough_crc: crate::crc32::Crc32::new(),
+            #[cfg(feature = "dfu_split")]
+            policy,
         }
     }
 
-    fn contains_key_event(event: KeyboardEvent) -> bool {
-        match event.pos {
-            KeyboardEventPos::Key(pos) => {
-                pos.row as usize >= ROW_OFFSET
-                    && (pos.row as usize) < ROW_OFFSET + ROW
-                    && pos.col as usize >= COL_OFFSET
-                    && (pos.col as usize) < COL_OFFSET + COL
-            }
-            KeyboardEventPos::RotaryEncoder(_) => false,
-        }
-    }
-
-    async fn release_all_keys(&mut self) {
-        for row in 0..ROW {
-            for col in 0..COL {
-                if self.pressed_keys[row][col] {
-                    self.pressed_keys[row][col] = false;
-                    KEY_EVENT_CHANNEL
-                        .send(KeyboardEvent::key(
-                            (row + ROW_OFFSET) as u8,
-                            (col + COL_OFFSET) as u8,
-                            false,
-                        ))
-                        .await;
-                }
+    /// Send a message to the peripheral, returning Err on disconnect.
+    async fn send(&mut self, msg: &SplitMessage) -> Result<(), ()> {
+        debug!("Sending message to peripheral {}: {:?}", self.id, msg);
+        match self.transceiver.write(msg).await {
+            Ok(_) => Ok(()),
+            Err(SplitDriverError::Disconnected) => Err(()),
+            Err(e) => {
+                error!("SplitDriver write error: {:?}", e);
+                Ok(())
             }
         }
     }
 
     /// Run the manager.
     ///
-    /// The manager receives from the peripheral and forward the message to `KEY_EVENT_CHANNEL`.
-    /// It also syncs `ConnectionState` changes to the peripheral, with a slow
-    /// periodic fallback in case a state-change event is missed.
+    /// The manager receives from the peripheral and publishes input events.
+    /// It also syncs the central's `ConnectionStatus` to the peripheral on every
+    /// change as an informational signal
     pub(crate) async fn run(mut self) {
-        let mut conn_state = CONNECTION_STATE.load(Ordering::Acquire);
-        // Send connection state once on start
-        if let Err(e) = self.transceiver.write(&SplitMessage::ConnectionState(conn_state)).await {
-            match e {
-                SplitDriverError::Disconnected => return,
-                _ => error!("SplitDriver write error: {:?}", e),
-            }
-        }
+        use crate::event::EventSubscriber;
+
+        let mut boot_sub = super::SplitBootEvent::subscriber();
+        let mut indicator_sub = crate::event::LedIndicatorEvent::subscriber();
+        let mut layer_sub = crate::event::LayerChangeEvent::subscriber();
+        // Subscribe before the initial send so any change racing past the
+        // snapshot is still delivered to us.
+        let mut connection_sub = crate::event::ConnectionStatusChangeEvent::subscriber();
         #[cfg(feature = "_ble")]
-        if let Err(e) = self
-            .transceiver
-            .write(&SplitMessage::Sleep(
-                crate::ble::SLEEPING_STATE.load(Ordering::Acquire),
+        let mut clear_peer_sub = crate::event::ClearPeerEvent::subscriber();
+        #[cfg(feature = "display")]
+        let mut wpm_sub = crate::event::WpmUpdateEvent::subscriber();
+        #[cfg(feature = "display")]
+        let mut modifier_sub = crate::event::ModifierEvent::subscriber();
+        let mut sleep_sub = crate::event::SleepStateEvent::subscriber();
+
+        // Send the current state once on startup so the peripheral matches us
+        // even when no transition has happened since the central booted.
+        if self
+            .send(&SplitMessage::ConnectionStatus(
+                crate::state::current_connection_status(),
             ))
             .await
+            .is_err()
         {
-            match e {
-                SplitDriverError::Disconnected => return,
-                _ => error!("SplitDriver write error: {:?}", e),
-            }
+            return;
         }
 
-        let mut last_state_check_time = Instant::now();
-        let mut last_sync_time = last_state_check_time;
-        let mut subscriber = CONTROLLER_CHANNEL
-            .subscriber()
-            .expect("Failed to create split message subscriber: MaximumSubscribersReached");
+        if self
+            .send(&SplitMessage::SleepState(crate::state::current_sleep_state()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        #[cfg(feature = "dfu_split")]
+        self.check_firmware_update().await;
 
+        let matrix_config = self.keys.matrix_config;
         loop {
-            // Check the local atomic state frequently without radio traffic;
-            // the slower timer is only a BLE fallback sync.
-            let check_elapsed = last_state_check_time.elapsed().as_millis();
-            let sync_elapsed = last_sync_time.elapsed().as_millis();
-            if check_elapsed >= CONNECTION_STATE_CHECK_INTERVAL_MS || sync_elapsed >= STATE_SYNC_INTERVAL_MS {
-                let current_conn_state = CONNECTION_STATE.load(Ordering::Acquire);
-                last_state_check_time = Instant::now();
-
-                if current_conn_state != conn_state {
-                    conn_state = current_conn_state;
-                    trace!("Connection state changed: {}", conn_state);
-                    if let Err(e) = self.transceiver.write(&SplitMessage::ConnectionState(conn_state)).await {
-                        match e {
-                            SplitDriverError::Disconnected => return,
-                            _ => error!("SplitDriver write error: {:?}", e),
-                        }
-                    }
-                    last_sync_time = last_state_check_time;
-                } else if sync_elapsed >= STATE_SYNC_INTERVAL_MS {
-                    trace!("Fallback state sync to peripheral: {}", conn_state);
-                    if let Err(e) = self.transceiver.write(&SplitMessage::ConnectionState(conn_state)).await {
-                        match e {
-                            SplitDriverError::Disconnected => return,
-                            _ => error!("SplitDriver write error: {:?}", e),
-                        }
-                    }
-                    #[cfg(feature = "_ble")]
-                    if let Err(e) = self
-                        .transceiver
-                        .write(&SplitMessage::Sleep(
-                            crate::ble::SLEEPING_STATE.load(Ordering::Acquire),
-                        ))
-                        .await
-                    {
-                        match e {
-                            SplitDriverError::Disconnected => return,
-                            _ => error!("SplitDriver write error: {:?}", e),
-                        }
-                    }
-                    last_sync_time = Instant::now();
-                }
+            #[cfg(feature = "dfu_split")]
+            if crate::dfu::passthrough_pending(self.id) {
+                self.handle_passthrough().await;
                 continue;
             }
 
-            let check_wait = CONNECTION_STATE_CHECK_INTERVAL_MS.saturating_sub(check_elapsed);
-            let sync_wait = STATE_SYNC_INTERVAL_MS.saturating_sub(sync_elapsed);
-            let wait_time = check_wait.min(sync_wait).max(1);
-
-            // Read messages, react to controller events, or perform a slow
-            // fallback sync.
-            match select3(
-                self.read_event(),
-                subscriber.next_message_pure(),
-                Timer::after_millis(wait_time),
-            )
-            .await
-            {
-                Either3::First(event) => match event {
-                    Event::Key(key_event) => KEY_EVENT_CHANNEL.send(key_event).await,
-                    _ => {
-                        if EVENT_CHANNEL.is_full() {
-                            let _ = EVENT_CHANNEL.receive().await;
-                        }
-                        EVENT_CHANNEL.send(event).await;
-                    }
-                },
-                Either3::Second(controller_msg) => {
-                    match controller_msg {
-                        #[cfg(feature = "_ble")]
-                        ControllerEvent::ClearPeer => {
-                            #[cfg(feature = "storage")]
-                            // Clear the peer address in storage
+            // Use select_biased_with_feature to handle feature-gated subscriber arms
+            let next_event_to_peri = async {
+                crate::select_biased_with_feature! {
+                    e = async { loop {
+                        let e = boot_sub.next_event().await;
+                        if matrix_config.contains(e.pos) { break e; }
+                    } }.fuse() => {
+                        if e.reboot { SplitMessage::Reboot } else { SplitMessage::Bootloader }
+                    },
+                    e = indicator_sub.next_event().fuse() => SplitMessage::KeyboardIndicator(e.0.into_bits()),
+                    e = layer_sub.next_event().fuse() => SplitMessage::Layer(e.0),
+                    e = connection_sub.next_event().fuse() => SplitMessage::ConnectionStatus(e.0),
+                    with_feature("_ble"): _ = clear_peer_sub.next_event().fuse() => {
+                        #[cfg(feature = "storage")]
+                        {
+                            use {crate::channel::FLASH_CHANNEL, crate::split::ble::PeerAddress, crate::storage::FlashOperationMessage};
                             FLASH_CHANNEL
-                                .send(FlashOperationMessage::PeerAddress(PeerAddress::new(
-                                    self.id as u8,
-                                    false,
-                                    [0; 6],
-                                )))
+                                .send(FlashOperationMessage::PeerAddress(PeerAddress::new(self.id as u8, false, [0; 6])))
                                 .await;
+                        }
+                        SplitMessage::ClearPeer
+                    },
+                    e = sleep_sub.next_event().fuse() => SplitMessage::SleepState(e.0),
+                    with_feature("display"): e = wpm_sub.next_event().fuse() => SplitMessage::Wpm(e.0),
+                    with_feature("display"): e = modifier_sub.next_event().fuse() => SplitMessage::Modifier(e.modifier.into_bits()),
+                }
+            };
 
-                            // Write `ClearPeer` message to peripheral
-                            debug!("Write ClearPeer message to peripheral {}", self.id);
-                            if let Err(e) = self.transceiver.write(&SplitMessage::ClearPeer).await {
-                                match e {
-                                    SplitDriverError::Disconnected => return,
-                                    _ => error!("SplitDriver write error: {:?}", e),
-                                }
-                            }
-                        }
-                        ControllerEvent::KeyboardIndicator(led_indicator) => {
-                            // Send KeyboardIndicator state to peripheral
-                            debug!(
-                                "Sending KeyboardIndicator to peripheral {}: {:?}",
-                                self.id, led_indicator
-                            );
-                            if let Err(e) = self
-                                .transceiver
-                                .write(&SplitMessage::KeyboardIndicator(led_indicator.into_bits()))
-                                .await
-                            {
-                                match e {
-                                    SplitDriverError::Disconnected => return,
-                                    _ => error!("SplitDriver write error: {:?}", e),
-                                }
-                            }
-                        }
-                        ControllerEvent::Layer(layer) => {
-                            // Send layer number to peripheral
-                            debug!("Sending layer number to peripheral {}: {}", self.id, layer);
-                            if let Err(e) = self.transceiver.write(&SplitMessage::Layer(layer)).await {
-                                match e {
-                                    SplitDriverError::Disconnected => return,
-                                    _ => error!("SplitDriver write error: {:?}", e),
-                                }
-                            }
-                        }
-                        ControllerEvent::Sleep(sleeping) => {
-                            if let Err(e) = self.transceiver.write(&SplitMessage::Sleep(sleeping)).await {
-                                match e {
-                                    SplitDriverError::Disconnected => return,
-                                    _ => error!("SplitDriver write error: {:?}", e),
-                                }
-                            }
-                        }
-                        ControllerEvent::Bootloader(event) if Self::contains_key_event(event) => {
-                            self.release_all_keys().await;
-                            if let Err(e) = self.transceiver.write(&SplitMessage::Bootloader).await {
-                                match e {
-                                    SplitDriverError::Disconnected => return,
-                                    _ => error!("SplitDriver write error: {:?}", e),
-                                }
-                            }
-                        }
-                        ControllerEvent::Reboot(event) if Self::contains_key_event(event) => {
-                            self.release_all_keys().await;
-                            if let Err(e) = self.transceiver.write(&SplitMessage::Reboot).await {
-                                match e {
-                                    SplitDriverError::Disconnected => return,
-                                    _ => error!("SplitDriver write error: {:?}", e),
-                                }
-                            }
-                        }
-                        _ => {}
+            #[cfg(feature = "dfu_split")]
+            let event_or_signal = select(next_event_to_peri, crate::dfu::PASSTHROUGH_SIGNAL.wait());
+            #[cfg(not(feature = "dfu_split"))]
+            let event_or_signal = next_event_to_peri;
+
+            match select(self.transceiver.read(), event_or_signal).await {
+                Either::First(read_result) => match read_result {
+                    #[cfg(feature = "dfu_split")]
+                    Ok(SplitMessage::FirmwareHashResponse(hash)) => {
+                        self.handle_proactive_hash(hash).await;
                     }
-
-                    let current_conn_state = CONNECTION_STATE.load(Ordering::Acquire);
-                    if current_conn_state != conn_state {
-                        conn_state = current_conn_state;
-                        trace!("Connection state changed: {}", conn_state);
-                        if let Err(e) = self.transceiver.write(&SplitMessage::ConnectionState(conn_state)).await {
-                            match e {
-                                SplitDriverError::Disconnected => return,
-                                _ => error!("SplitDriver write error: {:?}", e),
-                            }
+                    Ok(split_message) => self.process_peripheral_message(split_message).await,
+                    Err(SplitDriverError::Disconnected) => return,
+                    Err(e) => error!("Peripheral message read error: {:?}", e),
+                },
+                #[cfg(feature = "dfu_split")]
+                Either::Second(result) => match result {
+                    Either::First(msg) => {
+                        if self.send(&msg).await.is_err() {
+                            return;
                         }
-                        last_sync_time = Instant::now();
+                    }
+                    Either::Second(_) => {}
+                },
+                #[cfg(not(feature = "dfu_split"))]
+                Either::Second(msg) => {
+                    if self.send(&msg).await.is_err() {
+                        return;
                     }
                 }
-                Either3::Third(_) => {}
             }
         }
     }
-}
 
-impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFSET: usize, T: SplitReader + SplitWriter>
-    Drop for PeripheralManager<ROW, COL, ROW_OFFSET, COL_OFFSET, T>
-{
-    fn drop(&mut self) {
-        for row in 0..ROW {
-            for col in 0..COL {
-                if self.pressed_keys[row][col] {
-                    let event = KeyboardEvent::key(
-                        (row + ROW_OFFSET) as u8,
-                        (col + COL_OFFSET) as u8,
-                        false,
+    /// Process a single message from the peripheral.
+    async fn process_peripheral_message(&mut self, split_message: SplitMessage) {
+        trace!("Got message from peripheral: {:?}", split_message);
+        match split_message {
+            SplitMessage::Key(e) => match e.pos {
+                KeyboardEventPos::Key(key_pos) => {
+                    // Verify the row/col
+                    if key_pos.row >= self.keys.matrix_config.rows || key_pos.col >= self.keys.matrix_config.cols {
+                        error!("Invalid peripheral row/col: {} {}", key_pos.row, key_pos.col);
+                        return;
+                    }
+                    publish_event_async(KeyboardEvent::key(
+                        key_pos.row + self.keys.matrix_config.row_offset,
+                        key_pos.col + self.keys.matrix_config.col_offset,
+                        e.pressed,
+                    ))
+                    .await;
+                    if e.pressed {
+                        if !self.keys.pressed_keys.contains(&key_pos) {
+                            self.keys
+                                .pressed_keys
+                                .push(key_pos)
+                                .expect("validated peripheral matrix capacity");
+                        }
+                    } else if let Some(i) = self.keys.pressed_keys.iter().position(|p| *p == key_pos) {
+                        self.keys.pressed_keys.swap_remove(i);
+                    }
+                }
+                _ => publish_event_async(e).await,
+            },
+            // Non-key events are drop-on-full to keep the split read loop responsive.
+            SplitMessage::Pointing(e) => publish_event(e),
+            #[cfg(feature = "_ble")]
+            SplitMessage::BatteryStatus(state) => set_peripheral_battery(self.id, state.0),
+            #[cfg(feature = "dfu_split")]
+            SplitMessage::FirmwareHashResponse(hash) => {
+                info!("dfu_split: stale hash response ({:#x}) in event loop", hash);
+            }
+            #[cfg(feature = "dfu_split")]
+            SplitMessage::FirmwareChunkAck { offset, crc: _ } => {
+                info!("dfu_split: stale chunk ack (offset {}) in event loop, ignoring", offset);
+            }
+            #[cfg(feature = "dfu_split")]
+            SplitMessage::FirmwareUpdateConfirm => {
+                info!("dfu_split: stale update confirm in event loop, ignoring");
+            }
+            _ => warn!("{:?} should not come from peripheral", split_message),
+        }
+    }
+
+    /// Handle a proactive `FirmwareHashResponse` received in the main event
+    /// loop (after the initial `check_firmware_update` may have timed out
+    /// because the peripheral was not yet booted).
+    #[cfg(feature = "dfu_split")]
+    async fn handle_proactive_hash(&mut self, hash: u32) {
+        let (firmware, expected_hash) = match crate::dfu::get_firmware_update_data(self.id) {
+            Some(d) => d,
+            None => {
+                info!(
+                    "dfu_split: no firmware data set for peripheral {}, skipping proactive hash",
+                    self.id
+                );
+                return;
+            }
+        };
+        info!("dfu_split: proactive hash from peripheral ({:#x}), checking...", hash);
+        if hash == expected_hash {
+            info!("dfu_split: hash matches ({:#x}), no update needed", hash);
+            return;
+        }
+        info!("dfu_split: hash mismatch, starting update ({} bytes)", firmware.len());
+        self.send_firmware_update(firmware, expected_hash).await;
+    }
+
+    /// Process passthrough DFU chunks (fire-and-forget with per-chunk ack).
+    ///
+    /// Called from the event loop when [`passthrough_pending`] returns
+    /// `true`.  Drains the entire `PASSTHROUGH_CMD` queue, forwarding
+    /// each chunk over the split link and waiting for a
+    /// `FirmwareChunkAck` before proceeding to the next.
+    ///
+    /// On `Finish`, triggers end-to-end CRC verification: the peripheral
+    /// reads back its DFU partition, sends the CRC-32, the central
+    /// compares, and sends `FirmwareCrcOk` / `FirmwareCrcFail`.
+    #[cfg(feature = "dfu_split")]
+    async fn handle_passthrough(&mut self) {
+        use embassy_time::{Duration, Instant, Timer};
+
+        while let Some(cmd) = crate::dfu::passthrough_take_command() {
+            match cmd {
+                crate::dfu::PassthroughCommand::Chunk(chunk) => {
+                    debug!(
+                        "dfu_split/passthrough: sending chunk @ offset {} ({} bytes)",
+                        chunk.offset, chunk.len
                     );
-                    if KEY_EVENT_CHANNEL.try_send(event).is_err() {
-                        warn!(
-                            "Failed to release peripheral key on disconnect: {} {}",
-                            row + ROW_OFFSET,
-                            col + COL_OFFSET
+                    self.passthrough_crc.update(&chunk.data[..chunk.len as usize]);
+                    let msg = SplitMessage::FirmwareChunk {
+                        offset: chunk.offset,
+                        len: chunk.len,
+                        data: super::FirmwareChunkData(chunk.data),
+                    };
+                    if self.send(&msg).await.is_err() {
+                        error!("dfu_split/passthrough: disconnected during chunk send");
+                        crate::dfu::passthrough_done_if_empty();
+                        return;
+                    }
+
+                    // Wait for the peripheral to acknowledge this chunk
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        match select(self.transceiver.read(), Timer::at(deadline)).await {
+                            Either::First(Ok(SplitMessage::FirmwareChunkAck { offset, .. }))
+                                if offset == chunk.offset =>
+                            {
+                                break;
+                            }
+                            Either::First(Ok(_)) => {}
+                            Either::First(Err(e)) => {
+                                error!("dfu_split/passthrough: read error: {:?}", e);
+                                break;
+                            }
+                            Either::Second(_) => {
+                                error!("dfu_split/passthrough: timeout waiting for chunk ack");
+                                break;
+                            }
+                        }
+                    }
+
+                    crate::dfu::passthrough_done_if_empty();
+                }
+                crate::dfu::PassthroughCommand::Finish => {
+                    info!("dfu_split/passthrough: DFU download complete, starting end-to-end verification");
+
+                    if self.send(&SplitMessage::FirmwareUpdateComplete).await.is_err() {
+                        error!("dfu_split/passthrough: disconnected during finish");
+                        crate::dfu::passthrough_done_if_empty();
+                        return;
+                    }
+
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let crc = loop {
+                        match select(self.transceiver.read(), Timer::at(deadline)).await {
+                            Either::First(Ok(SplitMessage::FirmwareCrcReport(crc))) => {
+                                break Some(crc);
+                            }
+                            Either::First(Ok(_)) => {}
+                            Either::First(Err(e)) => {
+                                error!("dfu_split/passthrough: read error: {:?}", e);
+                                break None;
+                            }
+                            Either::Second(_) => {
+                                error!("dfu_split/passthrough: timeout waiting for CRC");
+                                break None;
+                            }
+                        }
+                    };
+
+                    let Some(peripheral_crc) = crc else {
+                        error!("dfu_split/passthrough: CRC verification failed");
+                        self.send(&SplitMessage::FirmwareCrcFail).await.ok();
+                        crate::dfu::passthrough_done_if_empty();
+                        return;
+                    };
+
+                    let central_crc = self.passthrough_crc.finalize();
+                    self.passthrough_crc = crate::crc32::Crc32::new();
+
+                    if central_crc != peripheral_crc {
+                        error!(
+                            "dfu_split/passthrough: CRC mismatch (central={:#010x}, peripheral={:#010x})",
+                            central_crc, peripheral_crc
+                        );
+                        self.send(&SplitMessage::FirmwareCrcFail).await.ok();
+                        crate::dfu::passthrough_done_if_empty();
+                        return;
+                    }
+
+                    info!("dfu_split/passthrough: CRC OK, confirming update");
+                    if self.send(&SplitMessage::FirmwareCrcOk).await.is_err() {
+                        error!("dfu_split/passthrough: disconnected during CRC OK");
+                        crate::dfu::passthrough_done_if_empty();
+                        return;
+                    }
+
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        match select(self.transceiver.read(), Timer::at(deadline)).await {
+                            Either::First(Ok(SplitMessage::FirmwareUpdateConfirm)) => {
+                                info!("dfu_split/passthrough: peripheral confirmed, update complete");
+                                break;
+                            }
+                            Either::First(Ok(_)) => {}
+                            Either::First(Err(e)) => {
+                                error!("dfu_split: FirmwareUpdateConfirm error {:?}", e);
+                                break;
+                            }
+                            Either::Second(_) => {
+                                info!("dfu_split: FirmwareUpdateConfirm timeout on confirm");
+                                break;
+                            }
+                        }
+                    }
+
+                    crate::dfu::passthrough_done_if_empty();
+                }
+            }
+        }
+    }
+
+    /// Check if the peripheral's firmware is up to date and update if needed.
+    ///
+    /// Called once at connection start.  Depending on [`UpdatePolicy`]:
+    ///
+    /// * `MatchHash` — sends a `FirmwareHashQuery`, compares the
+    ///   peripheral's response against the expected CRC-32, and only
+    ///   flashes when they differ.
+    /// * `Force` — skips the hash query entirely and always flashes.
+    #[cfg(feature = "dfu_split")]
+    async fn check_firmware_update(&mut self) {
+        use embassy_time::{Duration, Instant, Timer};
+
+        let (firmware, expected_hash) = match crate::dfu::get_firmware_update_data(self.id) {
+            Some(d) => d,
+            None => {
+                info!("dfu_split: no firmware data for peripheral {}", self.id);
+                return;
+            }
+        };
+
+        match self.policy {
+            UpdatePolicy::Force => {
+                info!("dfu_split: force update enabled, sending {} bytes", firmware.len());
+                self.send_firmware_update(firmware, expected_hash).await;
+                return;
+            }
+            UpdatePolicy::MatchHash => {}
+        }
+
+        info!("dfu_split: checking peripheral firmware...");
+        if self.send(&SplitMessage::FirmwareHashQuery).await.is_err() {
+            error!("dfu_split: disconnected during hash query");
+            return;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let hash = loop {
+            match select(self.transceiver.read(), Timer::at(deadline)).await {
+                Either::First(Ok(SplitMessage::FirmwareHashResponse(h))) => break Some(h),
+                Either::First(Ok(_)) => {}
+                Either::First(Err(e)) => {
+                    error!("read error: {:?}", e);
+                    break None;
+                }
+                Either::Second(_) => break None,
+            }
+        };
+
+        let peripheral_hash = match hash {
+            Some(h) => h,
+            None => {
+                info!("dfu_split: no hash, starting update");
+                self.send_firmware_update(firmware, expected_hash).await;
+                return;
+            }
+        };
+
+        if peripheral_hash == expected_hash {
+            info!("dfu_split: hash matches, no update needed");
+            return;
+        }
+
+        info!("dfu_split: hash mismatch, starting update ({} bytes)", firmware.len());
+        self.send_firmware_update(firmware, expected_hash).await;
+    }
+
+    /// Send the full firmware binary to the peripheral in 256-byte chunks.
+    ///
+    /// Each chunk is checked with per-chunk CRC-32 verification.  If a
+    /// chunk fails (CRC mismatch or timeout) it is retried up to 3 times.
+    /// The entire transfer is retried up to 3 attempts on failure.
+    ///
+    /// On success, the peripheral confirms and resets into the new
+    /// firmware.
+    #[cfg(feature = "dfu_split")]
+    async fn send_firmware_update(&mut self, firmware: &[u8], expected_hash: u32) {
+        use embassy_time::{Duration, Instant, Timer};
+        const MAX_RETRIES: u32 = 3;
+        const MAX_ATTEMPTS: u32 = 3;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            info!("dfu_split: update attempt {}/{}", attempt, MAX_ATTEMPTS);
+            publish_event(crate::event::DfuStatusEvent::new(rmk_types::dfu::DfuStatus::Started));
+
+            let mut central_crc = crate::crc32::Crc32::new();
+            let mut all_acked = true;
+
+            for (offset, chunk) in firmware.chunks(256).enumerate() {
+                let offset_bytes = (offset * 256) as u32;
+                let mut data = [0u8; 256];
+                data[..chunk.len()].copy_from_slice(chunk);
+                let chunk_crc = crate::crc32::crc32(&data[..chunk.len()]);
+                central_crc.update(&data[..chunk.len()]);
+
+                let mut retries = 0;
+                let mut acked = false;
+
+                while !acked && retries < MAX_RETRIES {
+                    if retries > 0 {
+                        info!(
+                            "dfu_split: retry {}/{} for chunk at offset {}",
+                            retries + 1,
+                            MAX_RETRIES,
+                            offset_bytes
                         );
                     }
+
+                    if self
+                        .send(&SplitMessage::FirmwareChunk {
+                            offset: offset_bytes,
+                            len: chunk.len() as u16,
+                            data: super::FirmwareChunkData(data),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        error!("dfu_split: disconnected during chunk send");
+                        return;
+                    }
+                    publish_event(crate::event::DfuStatusEvent::new(
+                        rmk_types::dfu::DfuStatus::Downloading,
+                    ));
+
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let got = loop {
+                        match select(self.transceiver.read(), Timer::at(deadline)).await {
+                            Either::First(Ok(SplitMessage::FirmwareChunkAck {
+                                offset: ack_offset,
+                                crc: ack_crc,
+                            })) => {
+                                if ack_offset == offset_bytes {
+                                    if ack_crc == chunk_crc {
+                                        break true;
+                                    }
+                                    warn!(
+                                        "dfu_split: per-chunk CRC mismatch at offset {} (peripheral={:#010x}, central={:#010x})",
+                                        offset_bytes, ack_crc, chunk_crc
+                                    );
+                                    break false;
+                                }
+                                info!(
+                                    "dfu_split: got ack for offset {}, waiting for {}",
+                                    ack_offset, offset_bytes
+                                );
+                            }
+                            Either::First(Ok(other)) => {
+                                warn!("dfu_split: unexpected message: {:?}", other)
+                            }
+                            Either::First(Err(e)) => {
+                                error!("dfu_split: FirmwareChunkAck error {:?}", e);
+                                break false;
+                            }
+                            Either::Second(_) => break false,
+                        }
+                    };
+                    acked = got;
+                    retries += 1;
+                }
+
+                if !acked {
+                    error!(
+                        "dfu_split: chunk at offset {} failed after {} retries",
+                        offset_bytes, MAX_RETRIES
+                    );
+                    all_acked = false;
+                    break;
                 }
             }
-        }
-    }
-}
 
-impl<const ROW: usize, const COL: usize, const ROW_OFFSET: usize, const COL_OFFSET: usize, R: SplitReader + SplitWriter>
-    InputDevice for PeripheralManager<ROW, COL, ROW_OFFSET, COL_OFFSET, R>
-{
-    async fn read_event(&mut self) -> Event {
-        loop {
-            match self.transceiver.read().await {
-                Ok(SplitMessage::Key(e)) => {
-                    match e.pos {
-                        KeyboardEventPos::Key(key_pos) => {
-                            // Verify the row/col
-                            if key_pos.row as usize >= ROW || key_pos.col as usize >= COL {
-                                error!("Invalid peripheral row/col: {} {}", key_pos.row, key_pos.col);
-                                continue;
-                            }
+            if !all_acked {
+                continue;
+            }
 
-                            if CONNECTION_STATE.load(core::sync::atomic::Ordering::Acquire) {
-                                self.pressed_keys[key_pos.row as usize][key_pos.col as usize] = e.pressed;
-                                // Only when the connection is established, send the key event.
-                                let adjusted_key_event = KeyboardEvent::key(
-                                    key_pos.row + ROW_OFFSET as u8,
-                                    key_pos.col + COL_OFFSET as u8,
-                                    e.pressed,
-                                );
-                                return Event::Key(adjusted_key_event);
-                            } else {
-                                warn!(
-                                    "Key event from peripheral is ignored because the connection is not established."
-                                );
-                            }
+            let local_crc = central_crc.finalize();
+            if local_crc != expected_hash {
+                error!("dfu_split: central CRC mismatch — aborting");
+                return;
+            }
+
+            if self.send(&SplitMessage::FirmwareUpdateComplete).await.is_err() {
+                return;
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let peripheral_crc = loop {
+                match select(self.transceiver.read(), Timer::at(deadline)).await {
+                    Either::First(Ok(SplitMessage::FirmwareCrcReport(crc))) => break Some(crc),
+                    Either::First(Ok(_)) => {}
+                    Either::First(Err(e)) => {
+                        error!("dfu_split: FirmwareCrcReport error {:?}", e);
+                        break None;
+                    }
+                    Either::Second(_) => break None,
+                }
+            };
+
+            let Some(dfu_crc) = peripheral_crc else {
+                continue;
+            };
+
+            if dfu_crc == expected_hash {
+                info!("dfu_split: end-to-end CRC matches, confirming");
+                self.send(&SplitMessage::FirmwareCrcOk).await.ok();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match select(self.transceiver.read(), Timer::at(deadline)).await {
+                        Either::First(Ok(SplitMessage::FirmwareUpdateConfirm)) => {
+                            info!("dfu_split: peripheral confirmed CRC, complete");
+                            publish_event(crate::event::DfuStatusEvent::new(rmk_types::dfu::DfuStatus::Finished));
+                            return;
                         }
-                        _ => {
-                            if CONNECTION_STATE.load(core::sync::atomic::Ordering::Acquire) {
-                                // Only when the connection is established, send the key event.
-                                return Event::Key(e);
-                            }
+                        Either::First(Ok(_)) => {}
+                        Either::First(Err(e)) => {
+                            error!("dfu_split: FirmwareCrcOk error {:?}", e);
+                            return;
+                        }
+                        Either::Second(_) => {
+                            error!("dfu_split: FirmwareCrcOk timeout");
+                            return;
                         }
                     }
                 }
-                Ok(SplitMessage::Event(event)) => {
-                    if let Event::PeripheralBattery(level) = event {
-                        crate::ble::battery_service::update_peripheral_battery(level);
-                    } else if CONNECTION_STATE.load(core::sync::atomic::Ordering::Acquire) {
-                        return event;
-                    } else {
-                        warn!("Event from peripheral is ignored because the connection is not established.");
-                    }
-                }
-                Ok(_) => {
-                    // Ignore other types of messages
-                    debug!("Ignored non-event split message");
-                }
-                Err(e) => {
-                    error!("Peripheral message read error: {:?}", e);
-                }
+            } else {
+                warn!("dfu_split: end-to-end CRC mismatch, retrying");
+                self.send(&SplitMessage::FirmwareCrcFail).await.ok();
+                Timer::after(Duration::from_millis(100)).await;
             }
         }
+
+        error!("dfu_split: all {} update attempts failed", MAX_ATTEMPTS);
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod release_tests {
     use super::*;
+    use crate::test_support::test_block_on;
 
     struct TestDriver;
-
     impl SplitReader for TestDriver {
         async fn read(&mut self) -> Result<SplitMessage, SplitDriverError> {
-            panic!("test driver must not read")
+            panic!("unexpected read")
         }
     }
-
     impl SplitWriter for TestDriver {
-        async fn write(&mut self, _message: &SplitMessage) -> Result<usize, SplitDriverError> {
+        async fn write(&mut self, _: &SplitMessage) -> Result<usize, SplitDriverError> {
             Ok(0)
         }
     }
 
     #[test]
-    fn dropping_manager_releases_pressed_peripheral_keys() {
-        KEY_EVENT_CHANNEL.clear();
+    fn disconnect_preserves_full_queue_and_canceled_release() {
+        let mut sub = KeyboardEvent::subscriber();
+        let mut keys = PeripheralKeyState::new(PeripheralMatrixConfig {
+            rows: 4,
+            cols: 7,
+            row_offset: 4,
+            col_offset: 0,
+        });
+        test_block_on(async {
+            {
+                let mut manager = PeripheralManager::new(TestDriver, 0, &mut keys);
+                manager
+                    .process_peripheral_message(SplitMessage::Key(KeyboardEvent::key(0, 0, true)))
+                    .await;
+                assert_eq!(sub.try_next_message_pure(), Some(KeyboardEvent::key(4, 0, true)));
+                publish_event(KeyboardEvent::key(0, 0, false));
+                for _ in 1..crate::KEYBOARD_EVENT_CHANNEL_SIZE {
+                    publish_event(KeyboardEvent::key(0, 1, true));
+                }
+                // 模拟 BLE 断线取消正在等待队列空位的松开事件。
+                let mut release = core::pin::pin!(
+                    manager.process_peripheral_message(SplitMessage::Key(KeyboardEvent::key(0, 0, false)),)
+                );
+                assert!(futures::poll!(release.as_mut()).is_pending());
+            }
+            let mut cleanup = core::pin::pin!(keys.release_all());
+            assert!(futures::poll!(cleanup.as_mut()).is_pending());
+            assert_eq!(sub.try_next_message_pure(), Some(KeyboardEvent::key(0, 0, false)));
+            assert!(futures::poll!(cleanup.as_mut()).is_ready());
+            for _ in 1..crate::KEYBOARD_EVENT_CHANNEL_SIZE {
+                assert_eq!(sub.try_next_message_pure(), Some(KeyboardEvent::key(0, 1, true)));
+            }
+            assert_eq!(sub.try_next_message_pure(), Some(KeyboardEvent::key(4, 0, false)));
+            assert!(sub.try_next_message_pure().is_none());
+        });
+        assert!(keys.pressed_keys.is_empty());
+    }
 
-        let mut manager = PeripheralManager::<1, 1, 4, 2, _>::new(TestDriver, 0);
-        manager.pressed_keys[0][0] = true;
-        drop(manager);
+    #[test]
+    fn disconnect_releases_more_keys_than_queue_capacity() {
+        let mut sub = KeyboardEvent::subscriber();
+        let mut keys = PeripheralKeyState::new(PeripheralMatrixConfig {
+            rows: 4,
+            cols: 7,
+            row_offset: 4,
+            col_offset: 0,
+        });
+        test_block_on(async {
+            {
+                let mut manager = PeripheralManager::new(TestDriver, 0, &mut keys);
+                for index in 0..25u8 {
+                    manager
+                        .process_peripheral_message(SplitMessage::Key(KeyboardEvent::key(index / 7, index % 7, true)))
+                        .await;
+                    assert_eq!(
+                        sub.try_next_message_pure(),
+                        Some(KeyboardEvent::key(4 + index / 7, index % 7, true))
+                    );
+                }
+            }
+            embassy_futures::join::join(keys.release_all(), async {
+                for index in (0..25u8).rev() {
+                    assert_eq!(
+                        sub.next_message_pure().await,
+                        KeyboardEvent::key(4 + index / 7, index % 7, false)
+                    );
+                }
+            })
+            .await;
+            assert!(sub.try_next_message_pure().is_none());
+        });
+        assert!(keys.pressed_keys.is_empty());
+    }
 
-        assert_eq!(
-            KEY_EVENT_CHANNEL.try_receive().unwrap(),
-            KeyboardEvent::key(4, 2, false)
-        );
-        assert!(KEY_EVENT_CHANNEL.try_receive().is_err());
+    #[test]
+    fn disconnect_releases_held_keys_with_matrix_offsets() {
+        let mut sub = KeyboardEvent::subscriber();
+        let mut keys = PeripheralKeyState::new(PeripheralMatrixConfig {
+            rows: 4,
+            cols: 7,
+            row_offset: 4,
+            col_offset: 0,
+        });
+        {
+            let mut manager = PeripheralManager::new(TestDriver, 0, &mut keys);
+            test_block_on(manager.process_peripheral_message(SplitMessage::Key(KeyboardEvent::key(2, 3, true))));
+            assert_eq!(sub.try_next_message_pure(), Some(KeyboardEvent::key(6, 3, true)));
+        }
+        test_block_on(keys.release_all());
+        assert_eq!(sub.try_next_message_pure(), Some(KeyboardEvent::key(6, 3, false)));
+        assert!(sub.try_next_message_pure().is_none());
+    }
+
+    #[test]
+    fn released_and_invalid_positions_are_not_released_again() {
+        let mut sub = KeyboardEvent::subscriber();
+        let mut keys = PeripheralKeyState::new(PeripheralMatrixConfig {
+            rows: 4,
+            cols: 7,
+            row_offset: 4,
+            col_offset: 0,
+        });
+        {
+            let mut manager = PeripheralManager::new(TestDriver, 0, &mut keys);
+            test_block_on(async {
+                manager
+                    .process_peripheral_message(SplitMessage::Key(KeyboardEvent::key(0, 0, true)))
+                    .await;
+                manager
+                    .process_peripheral_message(SplitMessage::Key(KeyboardEvent::key(0, 0, false)))
+                    .await;
+                manager
+                    .process_peripheral_message(SplitMessage::Key(KeyboardEvent::key(4, 0, true)))
+                    .await;
+                manager
+                    .process_peripheral_message(SplitMessage::Key(KeyboardEvent::key(0, 7, true)))
+                    .await;
+            });
+            assert_eq!(sub.try_next_message_pure(), Some(KeyboardEvent::key(4, 0, true)));
+            assert_eq!(sub.try_next_message_pure(), Some(KeyboardEvent::key(4, 0, false)));
+        }
+        test_block_on(keys.release_all());
+        assert!(sub.try_next_message_pure().is_none());
     }
 }

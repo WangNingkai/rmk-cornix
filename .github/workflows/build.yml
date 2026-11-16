@@ -25,6 +25,14 @@ jobs:
             --component llvm-tools
           rustup default 1.96.0
 
+      - name: Install ARM C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+
+      - name: Install nextest
+        run: cargo install cargo-nextest --locked --version 0.9.152
+
       - name: Install cargo-make
         run: cargo install cargo-make --locked --version 0.37.24
 
@@ -35,11 +43,13 @@ jobs:
         run: cargo clippy --release --bins -- -D warnings
 
       - name: Run RMK library tests
+        env:
+          KEYBOARD_TOML_PATH: ${{ github.workspace }}/tests/rmk.toml
         run: >-
-          cargo test --manifest-path vendor/rmk/Cargo.toml
+          cargo nextest run --manifest-path vendor/rmk/Cargo.toml
           --target x86_64-unknown-linux-gnu
           --no-default-features
-          --features std,log,split,_ble
+          --features std,log,split,_ble,vial,storage
           --lib
 
       - name: Build release binaries

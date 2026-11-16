@@ -1,48 +1,27 @@
+pub(crate) mod context;
+// Physical-presence unlock gate, shared by the Vial (`vial` + `host_lock`)
+// and Rynk (`rynk` ⇒ `host_lock`) services.
+#[cfg(feature = "host_lock")]
+pub(crate) mod lock;
+#[cfg(feature = "rynk")]
+pub(crate) mod rynk;
 #[cfg(feature = "storage")]
 pub(crate) mod storage;
-pub mod via;
-
-use core::cell::RefCell;
-
-// TODO: Remove those aliases
-pub use via::UsbVialReaderWriter as UsbHostReaderWriter;
+// Shared transport-adapter error, used by the USB/BLE Vial and BLE Rynk
+// adapters. Gated to exactly the feature combos that compile an adapter.
+#[cfg(any(
+    all(feature = "vial", not(feature = "_no_usb")),
+    all(feature = "vial", feature = "_ble"),
+    all(feature = "rynk", feature = "_ble"),
+))]
+pub(crate) mod transport;
 #[cfg(feature = "vial")]
-pub(crate) use via::VialService as HostService;
+pub(crate) mod via;
 
+/// The active host-protocol service. Resolves to [`via::VialService`]
+/// under the `vial` feature and [`rynk::RynkService`] under `rynk` (the
+/// two are mutually exclusive).
+#[cfg(feature = "rynk")]
+pub use rynk::RynkService as HostService;
 #[cfg(feature = "vial")]
-use crate::config::VialConfig;
-use crate::descriptor::ViaReport;
-use crate::hid::{HidReaderTrait, HidWriterTrait};
-use crate::keymap::KeyMap;
-
-#[cfg(feature = "vial")]
-pub(crate) async fn run_host_communicate_task<
-    'a,
-    Rw: HidReaderTrait<ReportType = ViaReport> + HidWriterTrait<ReportType = ViaReport>,
-    const ROW: usize,
-    const COL: usize,
-    const NUM_LAYER: usize,
-    const NUM_ENCODER: usize,
->(
-    keymap: &'a RefCell<KeyMap<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>>,
-    reader_writer: Rw,
-    vial_config: VialConfig<'static>,
-) {
-    let mut service = HostService::new(keymap, vial_config, reader_writer);
-    service.run().await
-}
-
-#[cfg(not(feature = "vial"))]
-pub(crate) async fn run_host_communicate_task<
-    'a,
-    Rw: HidReaderTrait<ReportType = ViaReport> + HidWriterTrait<ReportType = ViaReport>,
-    const ROW: usize,
-    const COL: usize,
-    const NUM_LAYER: usize,
-    const NUM_ENCODER: usize,
->(
-    _keymap: &'a RefCell<KeyMap<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>>,
-    _reader_writer: Rw,
-) {
-    todo!()
-}
+pub use via::VialService as HostService;

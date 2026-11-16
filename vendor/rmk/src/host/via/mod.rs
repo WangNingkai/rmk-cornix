@@ -1,115 +1,47 @@
-use core::cell::RefCell;
-
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use embassy_time::{Instant, Timer};
-use embassy_usb::class::hid::HidReaderWriter;
-use embassy_usb::driver::Driver;
+use embassy_time::Instant;
+use embedded_io_async::{Read, Write};
 use rmk_types::protocol::vial::{VIA_FIRMWARE_VERSION, VIA_PROTOCOL_VERSION, ViaCommand, ViaKeyboardInfo};
-use ssmarshal::serialize;
 use vial::process_vial;
 
-use crate::config::VialConfig;
-use crate::descriptor::ViaReport;
-use crate::event::KeyboardEventPos;
-use crate::hid::{HidError, HidReaderTrait, HidWriterTrait};
-#[cfg(feature = "storage")]
-use crate::host::storage::{KeymapData, KeymapKey};
+use crate::config::{RmkConfig, VialConfig};
+use crate::hid::ViaReport;
+use crate::host::context::KeyboardContext;
 use crate::host::via::keycode_convert::{from_via_keycode, to_via_keycode};
 use crate::keymap::KeyMap;
-use crate::state::ConnectionState;
-use crate::{CONNECTION_STATE, MACRO_SPACE_SIZE, boot};
-#[cfg(feature = "storage")]
-use crate::{channel::FLASH_CHANNEL, storage::FlashOperationMessage};
+use crate::{MACRO_SPACE_SIZE, boot};
 
 pub(crate) mod keycode_convert;
 mod vial;
-#[cfg(feature = "vial_lock")]
-mod vial_lock;
 
-pub(crate) struct VialService<
-    'a,
-    RW: HidWriterTrait<ReportType = ViaReport> + HidReaderTrait<ReportType = ViaReport>,
-    const ROW: usize,
-    const COL: usize,
-    const NUM_LAYER: usize,
-    const NUM_ENCODER: usize,
-> {
-    // VialService holds a reference of keymap, for updating
-    keymap: &'a RefCell<KeyMap<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>>,
-
-    // Vial config
+pub struct VialService<'a> {
+    ctx: KeyboardContext<'a>,
     vial_config: VialConfig<'static>,
-
-    // Vail lock instance
-    #[cfg(feature = "vial_lock")]
-    locker: vial_lock::VialLock<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>,
-
-    // Usb vial hid reader writer
-    pub(crate) reader_writer: RW,
+    #[cfg(feature = "host_lock")]
+    locker: crate::host::lock::HostLock<'a>,
 }
 
-impl<
-    'a,
-    RW: HidWriterTrait<ReportType = ViaReport> + HidReaderTrait<ReportType = ViaReport>,
-    const ROW: usize,
-    const COL: usize,
-    const NUM_LAYER: usize,
-    const NUM_ENCODER: usize,
-> VialService<'a, RW, ROW, COL, NUM_LAYER, NUM_ENCODER>
-{
-    // VialService::new() should be called only once.
-    // Otherwise the `vial_buf.init()` will panic.
-    pub(crate) fn new(
-        keymap: &'a RefCell<KeyMap<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>>,
-        vial_config: VialConfig<'static>,
-        reader_writer: RW,
-    ) -> Self {
+impl<'a> VialService<'a> {
+    pub fn new(keymap: &'a KeyMap<'a>, config: &RmkConfig<'static>) -> Self {
         Self {
-            keymap,
-            vial_config,
-            #[cfg(feature = "vial_lock")]
-            locker: vial_lock::VialLock::<'_, ROW, COL, NUM_LAYER, NUM_ENCODER>::new(vial_config.unlock_keys, keymap),
-            reader_writer,
+            ctx: KeyboardContext::new(keymap),
+            vial_config: config.vial_config,
+            // Vial's poll cadence is ~100 ms (`VialCommand::UnlockPoll`).
+            #[cfg(feature = "host_lock")]
+            locker: crate::host::lock::HostLock::new(
+                config.vial_config.unlock_keys,
+                keymap,
+                config.vial_config.insecure,
+                embassy_time::Duration::from_millis(100),
+            ),
         }
     }
 
-    pub(crate) async fn run(&mut self) {
-        loop {
-            match self.process().await {
-                Ok(_) => continue,
-                Err(e) => {
-                    if ConnectionState::Disconnected == ConnectionState::from(&CONNECTION_STATE) {
-                        Timer::after_millis(1000).await;
-                    } else {
-                        error!("Process vial error: {:?}", e);
-                        Timer::after_millis(10000).await;
-                    }
-                }
-            }
-        }
-    }
-
-    pub(crate) async fn process(&mut self) -> Result<(), HidError> {
-        let mut via_report = self.reader_writer.read_report().await?;
-
-        self.process_via_packet(&mut via_report, self.keymap).await;
-
-        // Send via report back after processing
-        self.reader_writer.write_report(via_report).await?;
-
-        Ok(())
-    }
-
-    async fn process_via_packet(
-        &mut self,
-        report: &mut ViaReport,
-        keymap: &RefCell<KeyMap<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>>,
-    ) {
+    async fn process_via_packet(&self, report: &mut ViaReport) {
         let command_id = report.output_data[0];
 
-        // `report.input_data` is initialized using `report.output_data`
-        report.input_data = report.output_data;
-        // debug!("Received via command: {}, report: {:02X?}", via_command, report.output_data);
+        // Caller pre-fills `input_data` from `output_data`, so individual arms
+        // only need to overwrite the bytes they actually change.
         match command_id.into() {
             ViaCommand::GetProtocolVersion => {
                 BigEndian::write_u16(&mut report.input_data[1..3], VIA_PROTOCOL_VERSION);
@@ -123,22 +55,24 @@ impl<
                             BigEndian::write_u32(&mut report.input_data[2..6], value);
                         }
                         ViaKeyboardInfo::LayoutOptions => {
-                            // TODO: retrieve layout option from storage
-                            let layout_option: u32 = 0;
+                            let layout_option = self.ctx.layout_options();
                             BigEndian::write_u32(&mut report.input_data[2..6], layout_option);
                         }
+                        #[cfg(not(feature = "host_lock"))]
                         ViaKeyboardInfo::SwitchMatrixState => {
-                            #[cfg(feature = "vial_lock")]
-                            {
-                                #[cfg(not(feature = "vial_lock"))]
-                                {
-                                    self.keymap.borrow().matrix_state.read_all(&mut report.input_data[2..]);
-                                    error!("It is not sercure to use matrix tester without vial lock");
-                                }
-
-                                #[cfg(feature = "vial_lock")]
-                                if self.locker.is_unlocked() {
-                                    self.keymap.borrow().matrix_state.read_all(&mut report.input_data[2..]);
+                            error!("It is not secure to use matrix tester without vial lock");
+                        }
+                        #[cfg(feature = "host_lock")]
+                        ViaKeyboardInfo::SwitchMatrixState if self.locker.is_unlocked() => {
+                            let bitmap = &mut report.input_data[2..];
+                            self.ctx.read_matrix_state(bitmap);
+                            // Vial wants each row's bytes big-endian (QMK matrix_row_t order).
+                            let (rows, cols, _) = self.ctx.keymap_dimensions();
+                            let row_len = cols.div_ceil(8);
+                            if row_len > 1 {
+                                let len = (rows * row_len).min(bitmap.len());
+                                for row in bitmap[..len].chunks_mut(row_len) {
+                                    row.reverse();
                                 }
                             }
                         }
@@ -154,12 +88,9 @@ impl<
                 // Check the second u8
                 match report.output_data[1].try_into() {
                     Ok(v) => match v {
-                        #[cfg(feature = "storage")]
                         ViaKeyboardInfo::LayoutOptions => {
                             let layout_option = BigEndian::read_u32(&report.output_data[2..6]);
-                            FLASH_CHANNEL
-                                .send(FlashOperationMessage::LayoutOptions(layout_option))
-                                .await;
+                            self.ctx.set_layout_options(layout_option).await;
                         }
                         ViaKeyboardInfo::DeviceIndication => {
                             let _device_indication = report.output_data[2];
@@ -171,12 +102,10 @@ impl<
                 }
             }
             ViaCommand::DynamicKeymapGetKeyCode => {
-                let layer = report.output_data[1] as usize;
-                let row = report.output_data[2] as usize;
-                let col = report.output_data[3] as usize;
-                let action = keymap
-                    .borrow_mut()
-                    .get_action_at(KeyboardEventPos::key_pos(col as u8, row as u8), layer);
+                let layer = report.output_data[1];
+                let row = report.output_data[2];
+                let col = report.output_data[3];
+                let action = self.ctx.get_action(layer, row, col);
                 let keycode = to_via_keycode(action);
                 info!("Getting keycode: {:02X} at ({},{}), layer {}", keycode, row, col, layer);
                 BigEndian::write_u16(&mut report.input_data[4..6], keycode);
@@ -191,18 +120,7 @@ impl<
                     "Setting keycode: 0x{:02X} at ({},{}), layer {} as {:?}",
                     keycode, row, col, layer, action
                 );
-                keymap
-                    .borrow_mut()
-                    .set_action_at(KeyboardEventPos::key_pos(col, row), layer as usize, action);
-                #[cfg(feature = "storage")]
-                FLASH_CHANNEL
-                    .send(FlashOperationMessage::VialMessage(KeymapData::KeymapKey(KeymapKey {
-                        layer,
-                        col,
-                        row,
-                        action,
-                    })))
-                    .await;
+                self.ctx.set_action(layer, row, col, action).await;
             }
             ViaCommand::DynamicKeymapReset => {
                 warn!("Dynamic keymap reset -- not supported")
@@ -220,9 +138,8 @@ impl<
                 warn!("Custom get value -- not supported")
             }
             ViaCommand::EepromReset => {
-                warn!("Reseting storage..");
-                #[cfg(feature = "storage")]
-                FLASH_CHANNEL.send(FlashOperationMessage::Reset).await
+                warn!("Resetting storage..");
+                self.ctx.reset_storage().await;
                 // TODO: Reboot after a eeprom reset?
             }
             ViaCommand::BootloaderJump => {
@@ -236,15 +153,12 @@ impl<
             ViaCommand::DynamicKeymapMacroGetBufferSize => {
                 report.input_data[1] = (MACRO_SPACE_SIZE as u16 >> 8) as u8;
                 report.input_data[2] = (MACRO_SPACE_SIZE & 0xFF) as u8;
-                warn!("Macro get buffer size -- to be implemented")
             }
             ViaCommand::DynamicKeymapMacroGetBuffer => {
                 let offset = BigEndian::read_u16(&report.output_data[1..3]) as usize;
                 let size = report.output_data[3] as usize;
                 if size <= 28 {
-                    report.input_data[4..4 + size].copy_from_slice(
-                        &self.keymap.borrow().behavior.keyboard_macros.macro_sequences[offset..offset + size],
-                    );
+                    self.ctx.read_macro_buffer(offset, &mut report.input_data[4..4 + size]);
                     debug!("Get macro buffer: offset: {}, data: {:?}", offset, report.input_data);
                 } else {
                     report.input_data[0] = 0xFF;
@@ -255,37 +169,30 @@ impl<
                 let offset = BigEndian::read_u16(&report.output_data[1..3]);
                 // Current sequence size, <= 28
                 let size = report.output_data[3];
-                // End of current sequence in the macro cache
-                let end = offset + size as u16;
+                // `output_data` is 32 bytes, so the payload slice output_data[4..4 + size]
+                // is only valid for size <= 28. Reject oversized writes instead of
+                // panicking, mirroring the DynamicKeymapMacroGetBuffer handler above.
+                if size <= 28 {
+                    // End of current sequence in the macro cache
+                    // The first sequence, reset the macro cache
+                    if offset == 0 {
+                        self.ctx.reset_macro_buffer();
+                    }
 
-                // The first sequence, reset the macro cache
-                if offset == 0 {
-                    self.keymap.borrow_mut().behavior.keyboard_macros.macro_sequences = [0; MACRO_SPACE_SIZE];
-                }
-
-                // Update macro cache
-                info!("Setting macro buffer, offset: {}, size: {}", offset, size);
-                self.keymap.borrow_mut().behavior.keyboard_macros.macro_sequences[offset as usize..end as usize]
-                    .copy_from_slice(&report.output_data[4..4 + size as usize]);
-
-                // Then flush macros to storage
-                // #[cfg(feature = "storage")]
-                // let num_zero =
-                //     count_zeros(&self.keymap.borrow_mut().behavior.keyboard_macros.macro_sequences[0..end as usize]);
-                #[cfg(feature = "storage")]
-                {
-                    let buf = self.keymap.borrow_mut().behavior.keyboard_macros.macro_sequences;
-                    FLASH_CHANNEL
-                        .send(FlashOperationMessage::VialMessage(KeymapData::Macro(buf)))
+                    // Update macro cache + flush full buffer to storage
+                    info!("Setting macro buffer, offset: {}, size: {}", offset, size);
+                    self.ctx
+                        .write_macro_buffer(offset as usize, &report.output_data[4..4 + size as usize])
                         .await;
-                    info!("Flush macros to storage")
+                } else {
+                    report.input_data[0] = 0xFF;
                 }
             }
             ViaCommand::DynamicKeymapMacroReset => {
                 warn!("Macro reset -- to be implemented")
             }
             ViaCommand::DynamicKeymapGetLayerCount => {
-                report.input_data[1] = NUM_LAYER as u8;
+                report.input_data[1] = self.ctx.keymap_dimensions().2 as u8;
             }
             ViaCommand::DynamicKeymapGetBuffer => {
                 let offset = BigEndian::read_u16(&report.output_data[1..3]);
@@ -293,19 +200,14 @@ impl<
                 let size = report.output_data[3];
                 debug!("Getting keymap buffer, offset: {}, size: {}", offset, size);
                 let mut idx = 4;
-                keymap
-                    .borrow()
-                    .layers
-                    .iter()
-                    .flatten()
-                    .flatten()
-                    .skip((offset / 2) as usize)
-                    .take((size / 2) as usize)
-                    .for_each(|a| {
-                        let kc = to_via_keycode(*a);
-                        BigEndian::write_u16(&mut report.input_data[idx..idx + 2], kc);
-                        idx += 2;
-                    });
+                let start = (offset / 2) as usize;
+                let count = (size / 2) as usize;
+                for i in 0..count {
+                    let a = self.ctx.get_action_flat(start + i);
+                    let kc = to_via_keycode(a);
+                    BigEndian::write_u16(&mut report.input_data[idx..idx + 2], kc);
+                    idx += 2;
+                }
             }
             ViaCommand::DynamicKeymapSetBuffer => {
                 debug!("Dynamic keymap set buffer");
@@ -313,39 +215,14 @@ impl<
                 // size <= 28
                 let size = report.output_data[3];
                 let mut idx = 4;
-                let (row_num, col_num, _layer_num) = keymap.borrow().get_keymap_config();
-                keymap
-                    .borrow_mut()
-                    .layers
-                    .iter_mut()
-                    .flatten()
-                    .flatten()
-                    .skip(offset as usize)
-                    .take(size as usize)
-                    .enumerate()
-                    .for_each(|(i, a)| {
-                        let via_keycode = LittleEndian::read_u16(&report.output_data[idx..idx + 2]);
-                        let action: rmk_types::action::KeyAction = from_via_keycode(via_keycode);
-                        *a = action;
-                        idx += 2;
-                        let current_offset = offset as usize + i;
-                        let (row, col, layer) = get_position_from_offset(current_offset, row_num, col_num);
-                        info!(
-                            "Setting keymap buffer of offset: {}, row,col,layer: {},{},{}",
-                            offset, row, col, layer
-                        );
-                        #[cfg(feature = "storage")]
-                        if let Err(_e) = FLASH_CHANNEL.try_send(FlashOperationMessage::VialMessage(
-                            KeymapData::KeymapKey(KeymapKey {
-                                layer: layer as u8,
-                                col: col as u8,
-                                row: row as u8,
-                                action,
-                            }),
-                        )) {
-                            error!("Send keymap setting command error")
-                        }
-                    });
+                let (rows, cols, _) = self.ctx.keymap_dimensions();
+                for i in 0..(size as usize) {
+                    let via_keycode = LittleEndian::read_u16(&report.output_data[idx..idx + 2]);
+                    let action = from_via_keycode(via_keycode);
+                    let flat_index = offset as usize + i;
+                    self.ctx.try_set_action_flat(flat_index, action, rows, cols);
+                    idx += 2;
+                }
             }
             ViaCommand::DynamicKeymapGetEncoder => {
                 warn!("Keymap get encoder -- not supported");
@@ -357,9 +234,9 @@ impl<
                 process_vial(
                     report,
                     &self.vial_config,
-                    #[cfg(feature = "vial_lock")]
-                    &mut self.locker,
-                    keymap,
+                    #[cfg(feature = "host_lock")]
+                    &self.locker,
+                    &self.ctx,
                 )
                 .await
             }
@@ -371,55 +248,109 @@ impl<
     }
 }
 
-fn get_position_from_offset(offset: usize, max_row: usize, max_col: usize) -> (usize, usize, usize) {
-    let layer = offset / (max_col * max_row);
-    let current_layer_offset = offset % (max_col * max_row);
-    let row = current_layer_offset / max_col;
-    let col = current_layer_offset % max_col;
-    (row, col, layer)
-}
-
-fn count_zeros(data: &[u8]) -> usize {
-    data.iter().filter(|&&x| x == 0).count()
-}
-
-pub struct UsbVialReaderWriter<'a, 'd, D: Driver<'d>> {
-    pub(crate) vial_reader_writer: &'a mut HidReaderWriter<'d, D, 32, 32>,
-}
-
-impl<'a, 'd, D: Driver<'d>> UsbVialReaderWriter<'a, 'd, D> {
-    pub(crate) fn new(vial_reader_writer: &'a mut HidReaderWriter<'d, D, 32, 32>) -> Self {
-        Self { vial_reader_writer }
+impl VialService<'_> {
+    /// Drive one Vial session against `rx`/`tx` (32-byte request → 32-byte
+    /// response, processed in place). Returns on any read/write error;
+    /// transport-specific reconnect lives in the caller.
+    pub async fn run_session<R: Read, T: Write>(&self, rx: &mut R, tx: &mut T) {
+        let mut buf = [0u8; 32];
+        loop {
+            if rx.read_exact(&mut buf).await.is_err() {
+                return;
+            }
+            let mut report = ViaReport {
+                input_data: buf,
+                output_data: buf,
+            };
+            self.process_via_packet(&mut report).await;
+            if tx.write_all(&report.input_data).await.is_err() {
+                return;
+            }
+        }
     }
 }
 
-impl<'d, D: Driver<'d>> HidWriterTrait for UsbVialReaderWriter<'_, 'd, D> {
-    type ReportType = ViaReport;
+#[cfg(test)]
+mod tests {
+    use embassy_futures::block_on;
+    use rmk_types::action::KeyAction;
 
-    async fn write_report(&mut self, report: Self::ReportType) -> Result<usize, HidError> {
-        let mut buffer = [0u8; 32];
-        let n = serialize(&mut buffer, &report).map_err(|_| HidError::ReportSerializeError)?;
-        self.vial_reader_writer
-            .write(&buffer[0..n])
-            .await
-            .map_err(HidError::UsbEndpointError)?;
-        Ok(n)
+    use super::*;
+    use crate::config::{BehaviorConfig, PositionalConfig};
+    use crate::keymap::{KeyMap, KeymapData};
+
+    /// Build a minimal 1x1x1 keymap + `VialService` and run `f` against it.
+    fn with_service<R>(f: impl FnOnce(&mut VialService) -> R) -> R {
+        let mut data = KeymapData::new([[[KeyAction::No]]]);
+        let mut behavior = BehaviorConfig::default();
+        let positional = PositionalConfig::<1, 1>::default();
+        let keymap = block_on(KeyMap::new(&mut data, &mut behavior, &positional));
+        let config = RmkConfig::default();
+        let mut service = VialService::new(&keymap, &config);
+        f(&mut service)
     }
-}
 
-impl<'d, D: Driver<'d>> HidReaderTrait for UsbVialReaderWriter<'_, 'd, D> {
-    type ReportType = ViaReport;
+    /// A `DynamicKeymapMacroSetBuffer` (0x0F) report with `offset = 0` and the
+    /// given payload `size` byte. The caller mirrors `Runnable::run` by seeding
+    /// `input_data` with a copy of `output_data`.
+    fn macro_set_buffer_report(size: u8) -> ViaReport {
+        let mut output_data = [0u8; 32];
+        output_data[0] = 0x0F; // DynamicKeymapMacroSetBuffer
+        output_data[3] = size;
+        ViaReport {
+            input_data: output_data,
+            output_data,
+        }
+    }
 
-    async fn read_report(&mut self) -> Result<ViaReport, HidError> {
-        let mut read_report = ViaReport {
-            input_data: [0; 32],
-            output_data: [0; 32],
-        };
-        self.vial_reader_writer
-            .read(&mut read_report.output_data)
-            .await
-            .map_err(HidError::UsbReadError)?;
+    // `output_data` is [u8; 32], so the handler slices `output_data[4..4 + size]`.
+    // size == 28 is the largest payload that fits (writes output_data[4..32]).
+    #[test]
+    fn macro_set_buffer_max_size_ok() {
+        with_service(|service| {
+            let mut report = macro_set_buffer_report(28);
+            block_on(service.process_via_packet(&mut report));
+        });
+    }
 
-        Ok(read_report)
+    // size == 29 slices output_data[4..33], which is out of bounds. The sibling
+    // DynamicKeymapMacroGetBuffer handler already rejects size > 28 with 0xFF;
+    // SetBuffer must do the same instead of panicking.
+    #[test]
+    fn macro_set_buffer_oversize_rejected() {
+        with_service(|service| {
+            let mut report = macro_set_buffer_report(29);
+            block_on(service.process_via_packet(&mut report));
+            assert_eq!(report.input_data[0], 0xFF);
+        });
+    }
+
+    /// A `GetKeyboardValue(LayoutOptions)` (0x02 0x02) or
+    /// `SetKeyboardValue(LayoutOptions)` (0x03 0x02) report carrying `value`
+    /// as the big-endian payload.
+    fn layout_options_report(command_id: u8, value: u32) -> ViaReport {
+        let mut output_data = [0u8; 32];
+        output_data[0] = command_id;
+        output_data[1] = 0x02; // ViaKeyboardInfo::LayoutOptions
+        BigEndian::write_u32(&mut output_data[2..6], value);
+        ViaReport {
+            input_data: output_data,
+            output_data,
+        }
+    }
+
+    // GetKeyboardValue(LayoutOptions) must return the value written by
+    // SetKeyboardValue(LayoutOptions) instead of a hardcoded 0, so the Vial
+    // GUI shows the user's selection again after a reconnect.
+    #[test]
+    fn layout_options_set_then_get_roundtrip() {
+        with_service(|service| {
+            let mut set = layout_options_report(0x03, 0x00C0_FFEE);
+            block_on(service.process_via_packet(&mut set));
+
+            let mut get = layout_options_report(0x02, 0);
+            block_on(service.process_via_packet(&mut get));
+            assert_eq!(BigEndian::read_u32(&get.input_data[2..6]), 0x00C0_FFEE);
+        });
     }
 }

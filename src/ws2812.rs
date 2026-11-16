@@ -1,12 +1,14 @@
 use embassy_nrf::gpio::Output;
 use embassy_nrf::pwm::{SequenceConfig, SequencePwm, SingleSequenceMode, SingleSequencer};
-use embassy_nrf::saadc::Saadc;
 use embassy_time::{Duration, Instant, Timer};
-use rmk::ble::BleState;
-use rmk::channel::{ControllerSub, CONTROLLER_CHANNEL, EVENT_CHANNEL};
-use rmk::controller::{Controller, PollingController};
 use rmk::embassy_futures::select::{select, Either};
-use rmk::event::{ControllerEvent, Event};
+use rmk::event::{
+    BatteryStatusEvent, CentralConnectedEvent, ChargingStateEvent, ConnectionStatusChangeEvent,
+    EventSubscriber, LedIndicatorEvent, PeripheralConnectedEvent, SleepStateEvent,
+};
+use rmk::processor::{PollingProcessor, Processor};
+use rmk::types::battery::BatteryStatus;
+use rmk::types::ble::BleState;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -14,9 +16,7 @@ pub enum Role {
     Peripheral,
 }
 
-// Polling cadence: fast while something is animating, slow when the LEDs are
-// idle. The slow tick only exists to notice USB plug/unplug and to trigger the
-// periodic battery sample, so it can be coarse to keep the radio asleep longer.
+// 动画期间快速刷新，空闲时每秒检查 USB 插拔；电量由 RMK 独立采样。
 const ANIM_INTERVAL: Duration = Duration::from_millis(33);
 const IDLE_INTERVAL: Duration = Duration::from_millis(1000);
 
@@ -25,7 +25,6 @@ const NOTICE: Duration = Duration::from_secs(3);
 const ACTIVITY: Duration = Duration::from_secs(60);
 const LOW_ALERT: Duration = Duration::from_secs(5);
 const LOW_QUIET: Duration = Duration::from_secs(5 * 60);
-const BATTERY_SAMPLE: Duration = Duration::from_secs(5 * 60);
 
 // Per-frame easing step toward the target color (~200 ms full fade at 30 fps).
 const FADE_STEP: u8 = 3;
@@ -36,8 +35,6 @@ const LOW_BLINK_PERIOD_MS: u64 = 1200;
 
 const BATTERY_LOW: u8 = 20;
 const BATTERY_FULL: u8 = 95;
-const ADC_DIVIDER_MEASURED: i32 = 2000;
-const ADC_DIVIDER_TOTAL: i32 = 2806;
 
 pub const PWM_TOP: u16 = 20;
 const W0: u16 = 0x8000 | 6;
@@ -115,12 +112,14 @@ const DIAMOND: Grb = Grb {
     b: 16,
 };
 
+#[rmk::macros::processor(subscribe = [
+    BatteryStatusEvent, ChargingStateEvent, PeripheralConnectedEvent, CentralConnectedEvent,
+    ConnectionStatusChangeEvent, LedIndicatorEvent, SleepStateEvent,
+])]
 pub struct Ws2812Indicator {
     pwm: SequencePwm<'static>,
     ext_power: Output<'static>,
-    battery_adc: Option<Saadc<'static, 1>>,
     role: Role,
-    sub: ControllerSub,
 
     battery: Option<u8>,
     charging: bool,
@@ -136,7 +135,6 @@ pub struct Ws2812Indicator {
     charge_since: Instant,
     low_alert_until: Instant,
     low_next_alert: Instant,
-    last_battery_sample: Option<Instant>,
 
     cur_inner: Grb,
     cur_outer: Grb,
@@ -150,23 +148,13 @@ pub struct Ws2812Indicator {
 }
 
 impl Ws2812Indicator {
-    pub fn new(
-        pwm: SequencePwm<'static>,
-        mut ext_power: Output<'static>,
-        battery_adc: Option<Saadc<'static, 1>>,
-        role: Role,
-    ) -> Self {
+    pub fn new(pwm: SequencePwm<'static>, mut ext_power: Output<'static>, role: Role) -> Self {
         ext_power.set_low();
         let now = Instant::now();
         Self {
             pwm,
             ext_power,
-            battery_adc,
             role,
-            sub: match CONTROLLER_CHANNEL.subscriber() {
-                Ok(sub) => sub,
-                Err(_) => panic!("controller subscriber unavailable"),
-            },
             battery: None,
             charging: false,
             ble_profile: 0,
@@ -180,7 +168,6 @@ impl Ws2812Indicator {
             charge_since: now,
             low_alert_until: now,
             low_next_alert: now,
-            last_battery_sample: None,
             cur_inner: OFF,
             cur_outer: OFF,
             tgt_inner: OFF,
@@ -240,14 +227,6 @@ impl Ws2812Indicator {
         self.ble_profile = profile;
         self.ble_connected = connected;
         self.ble_advertising = advertising;
-    }
-
-    fn set_ble_profile(&mut self, profile: u8) {
-        if profile != self.ble_profile {
-            self.ble_profile = profile;
-            self.ble_since = Instant::now();
-            self.pending = true;
-        }
     }
 
     fn set_sleeping(&mut self, sleeping: bool) {
@@ -375,43 +354,6 @@ impl Ws2812Indicator {
         }
     }
 
-    fn battery_percent_from_adc(val: i16) -> u8 {
-        let val = val as i32;
-        let full = 4755 * ADC_DIVIDER_MEASURED / ADC_DIVIDER_TOTAL;
-        let empty = 4055 * ADC_DIVIDER_MEASURED / ADC_DIVIDER_TOTAL;
-
-        if val > full {
-            100
-        } else if val < empty {
-            0
-        } else {
-            ((val * ADC_DIVIDER_TOTAL / ADC_DIVIDER_MEASURED - 4055) / 7) as u8
-        }
-    }
-
-    async fn sample_battery_if_due(&mut self, now: Instant) {
-        let due = match self.last_battery_sample {
-            None => true,
-            Some(last) => now.saturating_duration_since(last) >= BATTERY_SAMPLE,
-        };
-        if !due {
-            return;
-        }
-        self.last_battery_sample = Some(now);
-
-        let Some(battery_adc) = self.battery_adc.as_mut() else {
-            return;
-        };
-
-        let mut buf = [0i16; 1];
-        battery_adc.sample(&mut buf).await;
-        let level = Self::battery_percent_from_adc(buf[0]);
-        self.set_battery_level(level);
-        if self.role == Role::Peripheral {
-            let _ = EVENT_CHANNEL.try_send(Event::PeripheralBattery(level));
-        }
-    }
-
     /// Schedule the low-battery alert: blink for `LOW_ALERT`, stay quiet for
     /// `LOW_QUIET`, then repeat while the battery remains low.
     fn refresh_low_battery(&mut self, now: Instant) {
@@ -506,49 +448,54 @@ impl Ws2812Indicator {
     }
 }
 
-impl Controller for Ws2812Indicator {
-    type Event = ControllerEvent;
-
-    async fn process_event(&mut self, event: Self::Event) {
-        match event {
-            ControllerEvent::Battery(level) => self.set_battery_level(level),
-            ControllerEvent::ChargingState(charging) => self.set_charging(charging),
-            ControllerEvent::SplitPeripheral(_, connected) if self.role == Role::Central => {
-                self.set_peer_connected(connected);
-            }
-            ControllerEvent::SplitCentral(connected) if self.role == Role::Peripheral => {
-                self.set_peer_connected(connected);
-                if connected {
-                    // SplitCentral(true) is sent again after the central has
-                    // subscribed to split notifications. Sample on that ready
-                    // signal so a pre-subscription report cannot be lost.
-                    self.last_battery_sample = None;
-                    self.pending = true;
-                }
-            }
-            ControllerEvent::BleState(profile, state) if self.role == Role::Central => {
-                self.set_ble_state(profile, state);
-            }
-            ControllerEvent::BleProfile(profile) if self.role == Role::Central => {
-                self.set_ble_profile(profile);
-            }
-            ControllerEvent::KeyboardIndicator(indicator) if self.role == Role::Central => {
-                self.set_caps_lock(indicator.caps_lock());
-            }
-            ControllerEvent::Sleep(sleeping) => self.set_sleeping(sleeping),
-            _ => {}
+impl Ws2812Indicator {
+    async fn on_battery_status_event(&mut self, event: BatteryStatusEvent) {
+        if let BatteryStatus::Available {
+            level: Some(level), ..
+        } = event.0
+        {
+            self.set_battery_level(level);
         }
     }
 
-    async fn next_message(&mut self) -> Self::Event {
-        self.sub.next_message_pure().await
+    async fn on_charging_state_event(&mut self, event: ChargingStateEvent) {
+        self.set_charging(event.charging);
+    }
+
+    async fn on_peripheral_connected_event(&mut self, event: PeripheralConnectedEvent) {
+        if self.role == Role::Central {
+            self.set_peer_connected(event.connected);
+        }
+    }
+
+    async fn on_central_connected_event(&mut self, event: CentralConnectedEvent) {
+        if self.role == Role::Peripheral {
+            self.set_peer_connected(event.connected);
+        }
+    }
+
+    async fn on_connection_status_change_event(&mut self, event: ConnectionStatusChangeEvent) {
+        if self.role == Role::Central {
+            self.set_ble_state(event.0.ble.profile, event.0.ble.state);
+        }
+    }
+
+    async fn on_led_indicator_event(&mut self, event: LedIndicatorEvent) {
+        if self.role == Role::Central {
+            self.set_caps_lock(event.0.caps_lock());
+        }
+    }
+
+    async fn on_sleep_state_event(&mut self, event: SleepStateEvent) {
+        self.set_sleeping(event.0);
     }
 }
 
-impl PollingController for Ws2812Indicator {
-    // Required by the trait; the adaptive `polling_loop` below picks the actual
-    // cadence per cycle, so this is just the fast (animation) interval.
-    const INTERVAL: Duration = ANIM_INTERVAL;
+impl PollingProcessor for Ws2812Indicator {
+    // 实际间隔由下方自适应循环决定。
+    fn interval(&self) -> Duration {
+        ANIM_INTERVAL
+    }
 
     async fn update(&mut self) {
         let now = Instant::now();
@@ -561,7 +508,6 @@ impl PollingController for Ws2812Indicator {
         } else {
             let usb_present = embassy_nrf::pac::POWER.usbregstatus().read().vbusdetect();
             self.set_charging(usb_present);
-            self.sample_battery_if_due(now).await;
             self.refresh_low_battery(now);
             let inner = self.inner_effect();
             let outer = self.outer_effect();
@@ -577,16 +523,9 @@ impl PollingController for Ws2812Indicator {
         self.pending = false;
     }
 
-    /// Adaptive loop: animate at ~30 fps while anything is lit or fading, and
-    /// drop to a slow idle tick once the LEDs settle to off, which lets the
-    /// radio sleep undisturbed and cuts idle wakeups roughly tenfold.
-    ///
-    /// Tracks an absolute deadline rather than restarting the wait on every
-    /// event. Key presses are published to the controller channel, so during
-    /// fast typing events arrive continuously; resetting the interval each time
-    /// would push `update()` out indefinitely and starve the animation,
-    /// fade-out and battery sampling.
-    async fn polling_loop(&mut self) {
+    /// 动画按 33 ms 刷新，静止时降至 1 秒；绝对截止时间防止连续事件推迟刷新。
+    async fn polling_loop(&mut self) -> ! {
+        let mut sub = Self::subscriber();
         let mut deadline = Instant::now();
         loop {
             // When sleeping and fully settled (LEDs off), suspend periodic
@@ -595,8 +534,8 @@ impl PollingController for Ws2812Indicator {
             // 1-second idle tick that was waking it for no reason.
             if self.sleeping && !self.pending && !self.is_animating() {
                 loop {
-                    let event = self.next_message().await;
-                    self.process_event(event).await;
+                    let event = sub.next_event().await;
+                    self.process(event).await;
                     if self.pending {
                         break;
                     }
@@ -619,7 +558,7 @@ impl PollingController for Ws2812Indicator {
                 continue;
             }
 
-            match select(Timer::after(deadline - now), self.next_message()).await {
+            match select(Timer::after(deadline - now), sub.next_event()).await {
                 Either::First(_) => {
                     self.update().await;
                     let interval = if self.is_animating() {
@@ -630,7 +569,7 @@ impl PollingController for Ws2812Indicator {
                     deadline = Instant::now() + interval;
                 }
                 Either::Second(event) => {
-                    self.process_event(event).await;
+                    self.process(event).await;
                     // Reflect a state-changing event promptly by pulling the
                     // deadline in; never push it out (ignored events keep it).
                     if self.pending {

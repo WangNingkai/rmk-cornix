@@ -1,10 +1,13 @@
-use rmk_types::keycode::{KeyCode, from_ascii, to_ascii};
+#[cfg(feature = "vial")]
+use rmk_types::action::{Action, KeyAction};
+use rmk_types::keycode::{HidKeyCode, from_ascii, to_ascii};
 
 use crate::MACRO_SPACE_SIZE;
+#[cfg(feature = "vial")]
+use crate::host::via::keycode_convert::{from_via_keycode, to_via_keycode};
 use crate::keymap::fill_vec;
 
-/// encoded with the two bytes, content at the third byte
-/// 0b 0000 0001 1000-1010 (VIAL_MACRO_EXT) are not supported
+/// MacroOperation: encoded with the two bytes, content at the third byte
 ///
 /// TODO save space: refactor to use 1 byte for encoding and convert to/from vial 2 byte encoding
 #[derive(Debug, Clone)]
@@ -16,16 +19,26 @@ pub enum MacroOperation {
     /// by MacroOperations::define_macro_sequences()
     End,
     /// 0x01 01 + 1 byte keycode
-    Tap(KeyCode),
+    Tap(HidKeyCode),
     /// 0x01 02 + 1 byte keycode
-    Press(KeyCode),
+    Press(HidKeyCode),
     /// 0x01 03 + 1 byte keycode
-    Release(KeyCode),
-    /// 0x01 04 + 2 byte for the delay in ms
+    Release(HidKeyCode),
+    /// 0x01 04 + 2 byte for the delay in ms, Vial-packed (so at most 65024 ms)
     Delay(u16),
     /// Anything not covered above (and starting at
     /// 0x30 (= b'0'), is the 1 byte ascii character.
-    Text(KeyCode, bool), // bool = shifted
+    Text(HidKeyCode, bool), // bool = shifted
+    /// 0x01 05 + 2 byte 16-bit keycode: tap an extended (>8-bit) keycode, e.g. a
+    /// Bluetooth-profile or persistent-default-layer key, decoded via the Vial keycode table.
+    #[cfg(feature = "vial")]
+    TapAction(Action),
+    /// 0x01 06 + 2 byte 16-bit keycode: press (hold down) an extended keycode.
+    #[cfg(feature = "vial")]
+    PressAction(Action),
+    /// 0x01 07 + 2 byte 16-bit keycode: release an extended keycode.
+    #[cfg(feature = "vial")]
+    ReleaseAction(Action),
 }
 
 impl MacroOperation {
@@ -44,7 +57,7 @@ impl MacroOperation {
             (0, _) => (MacroOperation::End, offset),
             (1, 1) => {
                 if idx + 2 < macro_sequences.len() {
-                    let keycode = (macro_sequences[idx + 2] as u16).into();
+                    let keycode = macro_sequences[idx + 2].into();
                     (MacroOperation::Tap(keycode), offset + 3)
                 } else {
                     (MacroOperation::End, offset + 3)
@@ -52,7 +65,7 @@ impl MacroOperation {
             }
             (1, 2) => {
                 if idx + 2 < macro_sequences.len() {
-                    let keycode = (macro_sequences[idx + 2] as u16).into();
+                    let keycode = macro_sequences[idx + 2].into();
                     (MacroOperation::Press(keycode), offset + 3)
                 } else {
                     (MacroOperation::End, offset + 3)
@@ -60,7 +73,7 @@ impl MacroOperation {
             }
             (1, 3) => {
                 if idx + 2 < macro_sequences.len() {
-                    let keycode = (macro_sequences[idx + 2] as u16).into();
+                    let keycode = macro_sequences[idx + 2].into();
                     (MacroOperation::Release(keycode), offset + 3)
                 } else {
                     (MacroOperation::End, offset + 3)
@@ -75,7 +88,30 @@ impl MacroOperation {
                     (MacroOperation::End, offset + 4)
                 }
             }
-            (1, 5) | (1, 6) | (1, 7) => {
+            #[cfg(feature = "vial")]
+            (1, kind @ 5..=7) => {
+                if idx + 3 < macro_sequences.len() {
+                    // Undo Vial's little-endian encoding and its zero-low-byte escape
+                    // (`0xFF00 | kc>>8`, which keeps 0x00 out of the payload).
+                    let raw = u16::from_le_bytes([macro_sequences[idx + 2], macro_sequences[idx + 3]]);
+                    let keycode = if raw & 0xFF00 == 0xFF00 {
+                        (raw & 0x00FF) << 8
+                    } else {
+                        raw
+                    };
+                    let action = from_via_keycode(keycode).to_action();
+                    let operation = match kind {
+                        5 => MacroOperation::TapAction(action),
+                        6 => MacroOperation::PressAction(action),
+                        _ => MacroOperation::ReleaseAction(action),
+                    };
+                    (operation, offset + 4)
+                } else {
+                    (MacroOperation::End, offset + 4)
+                }
+            }
+            #[cfg(not(feature = "vial"))]
+            (1, 5..=7) => {
                 warn!("VIAL_MACRO_EXT is not supported");
                 (MacroOperation::Delay(0), offset + 4)
             }
@@ -209,14 +245,37 @@ fn serialize(macro_operation: &MacroOperation) -> heapless::Vec<u8, 4> {
             result
         }
         MacroOperation::Delay(duration) => {
+            // Vial packs the delay into two 1-based bytes so the payload never contains
+            // 0x00; this is the exact inverse of the decode in `get_next_macro_operation`.
             let mut result = heapless::Vec::from_slice(&[0x01, 0x04]).unwrap();
             result
-                .extend_from_slice(&duration.to_be_bytes())
+                .extend_from_slice(&[(duration % 255) as u8 + 1, (duration / 255).min(254) as u8 + 1])
                 .expect("impossible error");
             result
         }
         MacroOperation::Text(key_code, shifted) => heapless::Vec::from_slice(&[to_ascii(*key_code, *shifted)]).unwrap(),
+        #[cfg(feature = "vial")]
+        MacroOperation::TapAction(action) => serialize_extended_keycode(0x05, *action),
+        #[cfg(feature = "vial")]
+        MacroOperation::PressAction(action) => serialize_extended_keycode(0x06, *action),
+        #[cfg(feature = "vial")]
+        MacroOperation::ReleaseAction(action) => serialize_extended_keycode(0x07, *action),
     }
+}
+
+/// Inverse of the EXT decode in `get_next_macro_operation`: `0x01`, the kind
+/// (`0x05`/`0x06`/`0x07`), then the keycode little-endian with the zero-low-byte escape.
+#[cfg(feature = "vial")]
+fn serialize_extended_keycode(kind: u8, action: Action) -> heapless::Vec<u8, 4> {
+    let keycode = to_via_keycode(KeyAction::Single(action));
+    // Mirror Vial's zero-low-byte escape so the payload never contains 0x00.
+    let word = if keycode.is_multiple_of(256) {
+        0xFF00 | (keycode >> 8)
+    } else {
+        keycode
+    };
+    let [lo, hi] = word.to_le_bytes();
+    heapless::Vec::from_slice(&[0x01, kind, lo, hi]).unwrap()
 }
 
 #[cfg(test)]
@@ -226,11 +285,11 @@ mod test {
     #[test]
     fn test_define_one_macro_sequence_manual() {
         let macro_sequences = &[heapless::Vec::from_slice(&[
-            MacroOperation::Press(KeyCode::LShift),
-            MacroOperation::Tap(KeyCode::P),
-            MacroOperation::Release(KeyCode::LShift),
-            MacroOperation::Tap(KeyCode::A),
-            MacroOperation::Tap(KeyCode::T),
+            MacroOperation::Press(HidKeyCode::LShift),
+            MacroOperation::Tap(HidKeyCode::P),
+            MacroOperation::Release(HidKeyCode::LShift),
+            MacroOperation::Tap(HidKeyCode::A),
+            MacroOperation::Tap(HidKeyCode::T),
         ])
         .expect("too many elements")];
         let macro_sequences_binary = define_macro_sequences(macro_sequences);
@@ -248,16 +307,16 @@ mod test {
     fn test_define_two_macro_sequence_manual() {
         let macro_sequences_terminated_uneccessarily = [
             heapless::Vec::from_slice(&[
-                MacroOperation::Text(KeyCode::H, true),
-                MacroOperation::Text(KeyCode::I, false),
+                MacroOperation::Text(HidKeyCode::H, true),
+                MacroOperation::Text(HidKeyCode::I, false),
             ])
             .expect("too many elements"),
             heapless::Vec::from_slice(&[
-                MacroOperation::Press(KeyCode::LShift),
-                MacroOperation::Tap(KeyCode::P),
-                MacroOperation::Release(KeyCode::LShift),
-                MacroOperation::Tap(KeyCode::A),
-                MacroOperation::Tap(KeyCode::T),
+                MacroOperation::Press(HidKeyCode::LShift),
+                MacroOperation::Tap(HidKeyCode::P),
+                MacroOperation::Release(HidKeyCode::LShift),
+                MacroOperation::Tap(HidKeyCode::A),
+                MacroOperation::Tap(HidKeyCode::T),
             ])
             .expect("too many elements"),
         ];
@@ -277,27 +336,27 @@ mod test {
     fn test_define_macro_sequences_clean() {
         let macro_sequences_clean = [
             heapless::Vec::from_slice(&[
-                MacroOperation::Press(KeyCode::LShift),
-                MacroOperation::Tap(KeyCode::H),
-                MacroOperation::Release(KeyCode::LShift),
-                MacroOperation::Tap(KeyCode::E),
-                MacroOperation::Tap(KeyCode::L),
-                MacroOperation::Tap(KeyCode::L),
-                MacroOperation::Tap(KeyCode::O),
+                MacroOperation::Press(HidKeyCode::LShift),
+                MacroOperation::Tap(HidKeyCode::H),
+                MacroOperation::Release(HidKeyCode::LShift),
+                MacroOperation::Tap(HidKeyCode::E),
+                MacroOperation::Tap(HidKeyCode::L),
+                MacroOperation::Tap(HidKeyCode::L),
+                MacroOperation::Tap(HidKeyCode::O),
             ])
             .expect("too many elements"),
             heapless::Vec::from_slice(&[
-                MacroOperation::Tap(KeyCode::W),
-                MacroOperation::Tap(KeyCode::O),
-                MacroOperation::Tap(KeyCode::R),
-                MacroOperation::Tap(KeyCode::L),
-                MacroOperation::Tap(KeyCode::D),
+                MacroOperation::Tap(HidKeyCode::W),
+                MacroOperation::Tap(HidKeyCode::O),
+                MacroOperation::Tap(HidKeyCode::R),
+                MacroOperation::Tap(HidKeyCode::L),
+                MacroOperation::Tap(HidKeyCode::D),
             ])
             .expect("too many elements"),
             heapless::Vec::from_slice(&[
-                MacroOperation::Press(KeyCode::LShift),
-                MacroOperation::Tap(KeyCode::Kc2),
-                MacroOperation::Release(KeyCode::LShift),
+                MacroOperation::Press(HidKeyCode::LShift),
+                MacroOperation::Tap(HidKeyCode::Kc2),
+                MacroOperation::Release(HidKeyCode::LShift),
             ])
             .expect("too many elements"),
         ];
@@ -317,28 +376,28 @@ mod test {
     fn test_define_macro_sequences_uneccessarily_terminated() {
         let macro_sequences_terminated_uneccessarily = [
             heapless::Vec::from_slice(&[
-                MacroOperation::Press(KeyCode::LShift),
-                MacroOperation::Tap(KeyCode::H),
-                MacroOperation::Release(KeyCode::LShift),
-                MacroOperation::Tap(KeyCode::E),
-                MacroOperation::Tap(KeyCode::L),
-                MacroOperation::Tap(KeyCode::L),
-                MacroOperation::Tap(KeyCode::O),
+                MacroOperation::Press(HidKeyCode::LShift),
+                MacroOperation::Tap(HidKeyCode::H),
+                MacroOperation::Release(HidKeyCode::LShift),
+                MacroOperation::Tap(HidKeyCode::E),
+                MacroOperation::Tap(HidKeyCode::L),
+                MacroOperation::Tap(HidKeyCode::L),
+                MacroOperation::Tap(HidKeyCode::O),
                 MacroOperation::End,
             ])
             .expect("too many elements"),
             heapless::Vec::from_slice(&[
-                MacroOperation::Tap(KeyCode::W),
-                MacroOperation::Tap(KeyCode::O),
-                MacroOperation::Tap(KeyCode::R),
-                MacroOperation::Tap(KeyCode::L),
+                MacroOperation::Tap(HidKeyCode::W),
+                MacroOperation::Tap(HidKeyCode::O),
+                MacroOperation::Tap(HidKeyCode::R),
+                MacroOperation::Tap(HidKeyCode::L),
                 MacroOperation::End,
             ])
             .expect("too many elements"),
             heapless::Vec::from_slice(&[
-                MacroOperation::Press(KeyCode::LShift),
-                MacroOperation::Tap(KeyCode::Kc2),
-                MacroOperation::Release(KeyCode::LShift),
+                MacroOperation::Press(HidKeyCode::LShift),
+                MacroOperation::Tap(HidKeyCode::Kc2),
+                MacroOperation::Release(HidKeyCode::LShift),
                 MacroOperation::End,
             ])
             .expect("too many elements"),
@@ -359,35 +418,35 @@ mod test {
     fn test_define_macro_sequences_random_end_markers() {
         let macro_sequences_random_end_markers = [
             heapless::Vec::from_slice(&[
-                MacroOperation::Press(KeyCode::LShift),
-                MacroOperation::Tap(KeyCode::H),
+                MacroOperation::Press(HidKeyCode::LShift),
+                MacroOperation::Tap(HidKeyCode::H),
                 MacroOperation::End,
-                MacroOperation::Release(KeyCode::LShift),
-                MacroOperation::Tap(KeyCode::E),
+                MacroOperation::Release(HidKeyCode::LShift),
+                MacroOperation::Tap(HidKeyCode::E),
                 MacroOperation::End,
                 MacroOperation::End,
-                MacroOperation::Tap(KeyCode::L),
+                MacroOperation::Tap(HidKeyCode::L),
                 MacroOperation::End,
-                MacroOperation::Tap(KeyCode::L),
-                MacroOperation::Tap(KeyCode::O),
+                MacroOperation::Tap(HidKeyCode::L),
+                MacroOperation::Tap(HidKeyCode::O),
                 MacroOperation::End,
             ])
             .expect("too many elements"),
             heapless::Vec::from_slice(&[
-                MacroOperation::Tap(KeyCode::W),
-                MacroOperation::Tap(KeyCode::O),
+                MacroOperation::Tap(HidKeyCode::W),
+                MacroOperation::Tap(HidKeyCode::O),
                 MacroOperation::End,
                 MacroOperation::End,
                 MacroOperation::End,
                 MacroOperation::End,
-                MacroOperation::Tap(KeyCode::R),
-                MacroOperation::Tap(KeyCode::L),
+                MacroOperation::Tap(HidKeyCode::R),
+                MacroOperation::Tap(HidKeyCode::L),
             ])
             .expect("too many elements"),
             heapless::Vec::from_slice(&[
-                MacroOperation::Press(KeyCode::LShift),
-                MacroOperation::Tap(KeyCode::Kc2),
-                MacroOperation::Release(KeyCode::LShift),
+                MacroOperation::Press(HidKeyCode::LShift),
+                MacroOperation::Tap(HidKeyCode::Kc2),
+                MacroOperation::Release(HidKeyCode::LShift),
                 MacroOperation::End,
                 MacroOperation::End,
                 MacroOperation::End,
@@ -406,5 +465,127 @@ mod test {
             result_filled[i] = element
         }
         assert_eq!(macro_sequences_binary, result_filled);
+    }
+
+    /// Build a macro buffer from raw Vial wire bytes.
+    #[cfg(feature = "vial")]
+    fn wire(bytes: &[u8]) -> [u8; MACRO_SPACE_SIZE] {
+        let mut seq = [0u8; MACRO_SPACE_SIZE];
+        seq[..bytes.len()].copy_from_slice(bytes);
+        seq
+    }
+
+    // M0: TAP(BT0) -> Delay(100ms) -> TAP(PDF0), using the reconstructed wire vectors.
+    #[cfg(feature = "vial")]
+    #[test]
+    fn test_parse_extended_macro_m0() {
+        use rmk_types::action::Action;
+
+        let seq = wire(&[
+            0x01, 0x05, 0x7E, 0xFF, // TAP(BT0): USER00 = 0x7E00, zero-byte escaped
+            0x01, 0x04, 0x65, 0x01, // Delay 100ms
+            0x01, 0x05, 0xE0, 0x52, // TAP(PDF0): 0x52E0
+            0x00, // End
+        ]);
+        let start = MacroOperation::get_macro_sequence_start(&seq, 0).unwrap();
+
+        let (op, off) = MacroOperation::get_next_macro_operation(&seq, start, 0);
+        assert!(matches!(op, MacroOperation::TapAction(Action::User(0))));
+        let (op, off) = MacroOperation::get_next_macro_operation(&seq, start, off);
+        assert!(matches!(op, MacroOperation::Delay(100)));
+        let (op, off) = MacroOperation::get_next_macro_operation(&seq, start, off);
+        assert!(matches!(
+            op,
+            MacroOperation::TapAction(Action::PersistentDefaultLayer(0))
+        ));
+        let (op, _) = MacroOperation::get_next_macro_operation(&seq, start, off);
+        assert!(matches!(op, MacroOperation::End));
+    }
+
+    // M1: TAP(BT1) -> Delay(100ms) -> TAP(PDF1); BT1 has a non-zero low byte (no escape).
+    #[cfg(feature = "vial")]
+    #[test]
+    fn test_parse_extended_macro_m1() {
+        use rmk_types::action::Action;
+
+        let seq = wire(&[
+            0x01, 0x05, 0x01, 0x7E, // TAP(BT1): USER01 = 0x7E01, little-endian
+            0x01, 0x04, 0x65, 0x01, // Delay 100ms
+            0x01, 0x05, 0xE1, 0x52, // TAP(PDF1): 0x52E1
+            0x00,
+        ]);
+        let start = MacroOperation::get_macro_sequence_start(&seq, 0).unwrap();
+
+        let (op, off) = MacroOperation::get_next_macro_operation(&seq, start, 0);
+        assert!(matches!(op, MacroOperation::TapAction(Action::User(1))));
+        let (op, off) = MacroOperation::get_next_macro_operation(&seq, start, off);
+        assert!(matches!(op, MacroOperation::Delay(100)));
+        let (op, _) = MacroOperation::get_next_macro_operation(&seq, start, off);
+        assert!(matches!(
+            op,
+            MacroOperation::TapAction(Action::PersistentDefaultLayer(1))
+        ));
+    }
+
+    // EXT KEY DOWN / UP (0x01 06 / 0x01 07) decode into Press/ReleaseAction.
+    #[cfg(feature = "vial")]
+    #[test]
+    fn test_parse_extended_macro_down_up() {
+        use rmk_types::action::Action;
+
+        let seq = wire(&[0x01, 0x06, 0x7E, 0xFF, 0x01, 0x07, 0x7E, 0xFF, 0x00]);
+        let start = MacroOperation::get_macro_sequence_start(&seq, 0).unwrap();
+
+        let (op, off) = MacroOperation::get_next_macro_operation(&seq, start, 0);
+        assert!(matches!(op, MacroOperation::PressAction(Action::User(0))));
+        let (op, _) = MacroOperation::get_next_macro_operation(&seq, start, off);
+        assert!(matches!(op, MacroOperation::ReleaseAction(Action::User(0))));
+    }
+
+    // Serializing the decoded operations reproduces M0's exact wire bytes, including the
+    // 0x7E00 -> `7E FF` zero-byte escape and the Vial-packed delay.
+    #[cfg(feature = "vial")]
+    #[test]
+    fn test_serialize_extended_macro_keycodes() {
+        use rmk_types::action::Action;
+
+        let sequences = [heapless::Vec::from_slice(&[
+            MacroOperation::TapAction(Action::User(0)),
+            MacroOperation::Delay(100),
+            MacroOperation::TapAction(Action::PersistentDefaultLayer(0)),
+        ])
+        .expect("too many elements")];
+        let binary = define_macro_sequences(&sequences);
+        let expected = [
+            0x01, 0x05, 0x7E, 0xFF, 0x01, 0x04, 0x65, 0x01, 0x01, 0x05, 0xE0, 0x52, 0x00,
+        ];
+        assert_eq!(&binary[..expected.len()], &expected);
+    }
+
+    // A delay round-trips through the packed encoding at both ends of its range.
+    #[test]
+    fn test_delay_round_trips_through_the_packed_encoding() {
+        for ms in [0, 1, 50, 254, 255, 1000, 65024] {
+            let sequences = [heapless::Vec::from_slice(&[MacroOperation::Delay(ms)]).expect("too many elements")];
+            let binary = define_macro_sequences(&sequences);
+            let (op, _) = MacroOperation::get_next_macro_operation(&binary, 0, 0);
+            assert!(
+                matches!(op, MacroOperation::Delay(d) if d == ms),
+                "{ms}ms did not round-trip"
+            );
+        }
+    }
+
+    // A buffer that ends in the middle of an EXT command must terminate safely, without
+    // panicking or reading out of bounds.
+    #[cfg(feature = "vial")]
+    #[test]
+    fn test_parse_extended_macro_truncated_is_safe() {
+        let mut seq = [0u8; MACRO_SPACE_SIZE];
+        // "01 05" right at the end: the two payload bytes are out of range.
+        seq[MACRO_SPACE_SIZE - 2] = 0x01;
+        seq[MACRO_SPACE_SIZE - 1] = 0x05;
+        let (op, _) = MacroOperation::get_next_macro_operation(&seq, MACRO_SPACE_SIZE - 2, 0);
+        assert!(matches!(op, MacroOperation::End));
     }
 }

@@ -1,0 +1,5 @@
+# 库测试会构造自动鼠标层；Cornix 固件未启用它，容量为零。
+# 使用独立测试配置，避免测试夹具依赖实际键盘启用的功能。
+[rmk]
+split_peripherals_num = 1
+auto_mouse_layer_max_num = 4

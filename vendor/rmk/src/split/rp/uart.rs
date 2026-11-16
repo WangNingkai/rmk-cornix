@@ -9,6 +9,7 @@ use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::gpio::{Drive, Level, Pull, SlewRate};
 use embassy_rp::interrupt::Priority;
 use embassy_rp::interrupt::typelevel::{Binding, Handler, Interrupt};
+use embassy_rp::pac::io::vals::Oeover;
 use embassy_rp::pio::{
     Common, Config, Direction, FifoJoin, Instance, InterruptHandler, Pin, Pio, PioPin, ShiftDirection, StateMachine,
 };
@@ -19,8 +20,8 @@ use embassy_sync::waitqueue::AtomicWaker;
 use embassy_time::{Duration, Timer};
 use embedded_io_async::{ErrorType, Read, Write};
 use fixed::traits::ToFixed;
-use rp_pac::io::vals::Oeover;
 
+#[derive(Clone, Copy)]
 pub struct IrqBinding;
 unsafe impl<PIO: Instance> Binding<PIO::Interrupt, InterruptHandler<PIO>> for IrqBinding {}
 
@@ -62,7 +63,7 @@ impl UartBuffer {
 
 pub trait UartPioAccess {
     fn uart_buffer() -> &'static UartBuffer;
-    fn regs() -> &'static rp_pac::pio::Pio;
+    fn regs() -> &'static embassy_rp::pac::pio::Pio;
 }
 
 macro_rules! impl_pio_access {
@@ -72,15 +73,15 @@ macro_rules! impl_pio_access {
                 static BUFFER: UartBuffer = UartBuffer::new();
                 &BUFFER
             }
-            fn regs() -> &'static rp_pac::pio::Pio {
+            fn regs() -> &'static embassy_rp::pac::pio::Pio {
                 &$pio
             }
         }
     };
 }
 
-impl_pio_access!(embassy_rp::peripherals::PIO0, rp_pac::PIO0);
-impl_pio_access!(embassy_rp::peripherals::PIO1, rp_pac::PIO1);
+impl_pio_access!(embassy_rp::peripherals::PIO0, embassy_rp::pac::PIO0);
+impl_pio_access!(embassy_rp::peripherals::PIO1, embassy_rp::pac::PIO1);
 
 // PIO Buffered UART serial driver
 pub struct BufferedUart<'a, PIO: Instance + UartPioAccess> {
@@ -198,10 +199,12 @@ impl<'a, PIO: Instance + UartPioAccess> BufferedUart<'a, PIO> {
         let pins = [Some(&mut self.pin_rx), self.pin_tx.as_mut()];
 
         for pin in pins.into_iter().flatten() {
-            rp_pac::IO_BANK0
+            embassy_rp::pac::IO_BANK0
                 .gpio(pin.pin() as _)
                 .ctrl()
-                .modify(|f| f.set_oeover(Oeover::INVERT));
+                // `from_bits(1)` = the INVERT/Invert variant; compiles against both
+                // registry and git rp-pac (which renamed the variant casing).
+                .modify(|f| f.set_oeover(Oeover::from_bits(1)));
             pin.set_schmitt(true);
             pin.set_pull(Pull::Up);
             pin.set_slew_rate(SlewRate::Fast);
@@ -424,11 +427,18 @@ impl<PIO: Instance + UartPioAccess> Handler<PIO::Interrupt> for UartInterruptHan
                 let mut writer = unsafe { PIO::uart_buffer().buf_rx.writer() };
                 let rx_buf = writer.push_slice();
                 if rx_buf.len() > 0 {
+                    // SM1 RX FIFO is joined (FifoJoin::RxOnly), so depth is 8.
                     let mut n = 0;
-                    while (pio.fstat().read().rxempty() & 1 << 1 as u8) == 0 && n < rx_buf.len() {
-                        let byte = pio.rxf(1).read();
-                        rx_buf[n] = (byte >> 24) as u8;
-                        n += 1;
+                    while n < rx_buf.len() {
+                        let avail = pio.flevel().read().rx1() as usize;
+                        if avail == 0 {
+                            break;
+                        }
+                        let take = avail.min(rx_buf.len() - n);
+                        for slot in &mut rx_buf[n..n + take] {
+                            *slot = (pio.rxf(1).read() >> 24) as u8;
+                        }
+                        n += take;
                     }
                     writer.push_done(n);
                     PIO::Interrupt::unpend();
@@ -441,23 +451,29 @@ impl<PIO: Instance + UartPioAccess> Handler<PIO::Interrupt> for UartInterruptHan
             PIO::Interrupt::unpend();
             if PIO::uart_buffer().buf_tx.is_available() {
                 // Full-Duplex Mode
-                if !PIO::uart_buffer().buf_tx.is_full() {
-                    let mut reader = unsafe { PIO::uart_buffer().buf_tx.reader() };
-                    let tx_buf = reader.pop_slice();
-                    let mut n = 0;
-                    while (pio.fstat().read().txfull() & 1 << 0 as u8) == 0 && n < tx_buf.len() {
-                        let byte = tx_buf[n];
-                        pio.txf(0).write(|f| *f = byte as u32);
-                        n += 1;
+                let mut reader = unsafe { PIO::uart_buffer().buf_tx.reader() };
+                let tx_buf = reader.pop_slice();
+                // SM0 TX FIFO is joined (FifoJoin::TxOnly), so depth is 8.
+                const TX_FIFO_DEPTH: usize = 8;
+                let mut n = 0;
+                while n < tx_buf.len() {
+                    let free = TX_FIFO_DEPTH - pio.flevel().read().tx0() as usize;
+                    if free == 0 {
+                        break;
                     }
-                    reader.pop_done(n);
+                    let push = free.min(tx_buf.len() - n);
+                    for byte in &tx_buf[n..n + push] {
+                        pio.txf(0).write(|f| *f = *byte as u32);
+                    }
+                    n += push;
                 }
+                reader.pop_done(n);
                 if PIO::uart_buffer().buf_tx.is_empty() {
-                    PIO::regs().irqs(0).inte().modify(|i| i.set_sm0_txnfull(false));
+                    pio.irqs(0).inte().modify(|i| i.set_sm0_txnfull(false));
                 }
             } else {
                 // Half-Duplex Mode
-                PIO::regs().irqs(0).inte().modify(|i| i.set_sm0_txnfull(false));
+                pio.irqs(0).inte().modify(|i| i.set_sm0_txnfull(false));
                 PIO::uart_buffer().waker_tx.wake();
             }
         }
@@ -483,20 +499,44 @@ impl<PIO: Instance + UartPioAccess> Handler<PIO::Interrupt> for UartInterruptHan
 
 impl<'a, PIO: Instance + UartPioAccess> Read for BufferedUart<'a, PIO> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        self.read_buffer(buf).await
+        self.read_buffer(buf).await.map_err(|e| e.into())
     }
 }
 
 impl<'a, PIO: Instance + UartPioAccess> Write for BufferedUart<'a, PIO> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        self.write_buffer(buf).await
+        self.write_buffer(buf).await.map_err(|e| e.into())
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        self.flush().await
+        self.flush().await.map_err(|e| e.into())
+    }
+}
+
+#[derive(Debug)]
+// TODO: Remove NewError after embassy-rp updates to embedded-io-async 0.7
+pub struct NewError(Error);
+
+impl core::fmt::Display for NewError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl core::error::Error for NewError {}
+
+impl embedded_io_async::Error for NewError {
+    fn kind(&self) -> embedded_io_async::ErrorKind {
+        embedded_io_async::ErrorKind::Other
+    }
+}
+
+impl From<embassy_rp::uart::Error> for NewError {
+    fn from(value: embassy_rp::uart::Error) -> Self {
+        Self(value)
     }
 }
 
 impl<'a, PIO: Instance + UartPioAccess> ErrorType for BufferedUart<'a, PIO> {
-    type Error = Error;
+    type Error = NewError;
 }
