@@ -1,6 +1,7 @@
 #[cfg(feature = "subrating")]
 use bt_hci::{cmd::le::LeSetHostFeature, controller::ControllerCmdSync};
 use embassy_futures::join::join;
+use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Timer};
 use rmk_types::connection::ConnectionStatus;
 use trouble_host::prelude::*;
@@ -9,10 +10,17 @@ use trouble_host::prelude::*;
 use super::PeerAddress;
 use super::{GattSplitMessage, SplitMessage};
 use crate::ble::adv::{Adv, advertise};
-use crate::event::{CentralConnectedEvent, KeyboardEvent, SleepStateEvent, SubscribableEvent, publish_event};
+use crate::event::{
+    CentralConnectedEvent, KeyboardEvent, PeripheralReconnectByKeyEvent, SleepStateEvent, SubscribableEvent,
+    publish_event,
+};
 use crate::split::driver::{SplitDriverError, SplitReader, SplitWriter};
 use crate::split::peripheral::SplitPeripheral;
 use crate::state::update_status;
+
+const IDLE_RECONNECT_PAUSE: Duration = Duration::from_secs(20);
+// 左半连着主机休眠时每隔 5 秒尝试 1 秒，广播窗口需覆盖一次完整尝试周期。
+const IDLE_RECONNECT_WINDOW: Duration = Duration::from_secs(8);
 
 /// Gatt service used in split peripheral to send split message to central
 #[gatt_service(uuid = "4dd5fbaa-18e5-4b07-bf0a-353698659946")]
@@ -186,7 +194,43 @@ pub async fn initialize_nrf_ble_split_peripheral_and_run<
             update_status(|c| *c = ConnectionStatus::new());
             publish_event(CentralConnectedEvent { connected: false });
             publish_event(SleepStateEvent::new(false));
-            match split_peripheral_advertise(id, central_addr, &mut peripheral, &server).await {
+            let connection = match split_peripheral_advertise(id, central_addr, &mut peripheral, &server).await {
+                Err(BleHostError::BleHost(Error::Timeout)) => {
+                    publish_event(SleepStateEvent::new(true));
+                    let idle_attempt = async || {
+                        let addr = Address::random(central_addr?);
+                        let result = async {
+                            peripheral.set_filter_accept_list(&[addr]).await?;
+                            advertise(
+                                &mut peripheral,
+                                &server.server,
+                                Adv::IdleSplitPeripheral { id: id as u8 },
+                                IDLE_RECONNECT_WINDOW,
+                            )
+                            .await
+                        }
+                        .await;
+                        match result {
+                            Ok(conn) => Some(conn),
+                            Err(BleHostError::BleHost(Error::Timeout)) => None,
+                            Err(err) => {
+                                #[cfg(feature = "defmt")]
+                                let err = defmt::Debug2Format(&err);
+                                warn!("Idle split advertising failed: {:?}", err);
+                                None
+                            }
+                        }
+                    };
+                    let Some(conn) = wait_for_idle_reconnect(central_addr.is_some(), idle_attempt).await else {
+                        publish_event(PeripheralReconnectByKeyEvent);
+                        continue;
+                    };
+                    publish_event(SleepStateEvent::new(false));
+                    Ok(conn)
+                }
+                result => result,
+            };
+            match connection {
                 Ok(conn) => {
                     info!("Connected to the central");
                     publish_event(CentralConnectedEvent { connected: true });
@@ -211,15 +255,6 @@ pub async fn initialize_nrf_ble_split_peripheral_and_run<
                     conn.raw().disconnect();
                     info!("Disconnected from the central");
                 }
-                Err(BleHostError::BleHost(Error::Timeout)) => {
-                    // Timeout, wait new keys to continue
-                    error!("Connect to central timeout");
-                    publish_event(SleepStateEvent::new(true));
-                    let mut sub = KeyboardEvent::subscriber();
-                    sub.clear();
-                    let _ = sub.next_message_pure().await;
-                    continue;
-                }
                 Err(e) => {
                     #[cfg(feature = "defmt")]
                     let e = defmt::Debug2Format(&e);
@@ -232,6 +267,26 @@ pub async fn initialize_nrf_ble_split_peripheral_and_run<
     };
 
     join(crate::ble::ble_task(runner, &crate::ble::NoopHandler), peri_task).await;
+}
+
+async fn wait_for_idle_reconnect<T>(has_saved_peer: bool, mut attempt: impl AsyncFnMut() -> Option<T>) -> Option<T> {
+    let mut keys = KeyboardEvent::subscriber();
+    let pressed = async { while !keys.next_message_pure().await.pressed {} };
+    let reconnect = async {
+        if !has_saved_peer {
+            return core::future::pending().await;
+        }
+        loop {
+            Timer::after(IDLE_RECONNECT_PAUSE).await;
+            if let Some(conn) = attempt().await {
+                return conn;
+            }
+        }
+    };
+    match select(reconnect, pressed).await {
+        Either::First(conn) => Some(conn),
+        Either::Second(()) => None,
+    }
 }
 
 /// Reconnect to the saved central, falling back to seeking any central when it
@@ -251,4 +306,61 @@ async fn split_peripheral_advertise<'a, 'b, C: Controller>(
     }
     let seeking = Adv::SplitPeripheral { id: id as u8 };
     advertise(peripheral, &server.server, seeking, Duration::from_secs(300)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use embassy_time::Instant;
+
+    use super::*;
+    use crate::event::{AsyncEventPublisher, AsyncPublishableEvent};
+    use crate::test_support::test_block_on;
+
+    #[test]
+    fn idle_reconnect_retries_after_each_pause() {
+        test_block_on(async {
+            let start = Instant::now();
+            let mut attempts = 0;
+            let connection = wait_for_idle_reconnect(true, async || {
+                attempts += 1;
+                if attempts == 1 {
+                    assert!(start.elapsed() >= IDLE_RECONNECT_PAUSE);
+                    Timer::after(IDLE_RECONNECT_WINDOW).await;
+                    return None;
+                }
+                Some(attempts)
+            })
+            .await;
+            assert_eq!(connection, Some(2));
+            assert!(start.elapsed() >= IDLE_RECONNECT_PAUSE * 2 + IDLE_RECONNECT_WINDOW);
+        });
+    }
+
+    #[test]
+    fn idle_reconnect_wakes_on_press_with_or_without_saved_peer() {
+        test_block_on(async {
+            let sender = KeyboardEvent::publisher_async().unwrap();
+            for has_saved_peer in [false, true] {
+                let mut attempted = false;
+                let start = Instant::now();
+                let result = select(
+                    wait_for_idle_reconnect(has_saved_peer, async || {
+                        attempted = true;
+                        core::future::pending::<Option<()>>().await
+                    }),
+                    async {
+                        Timer::after(IDLE_RECONNECT_PAUSE + Duration::from_secs(1)).await;
+                        sender.publish_async(KeyboardEvent::key(0, 0, false)).await;
+                        Timer::after_secs(1).await;
+                        sender.publish_async(KeyboardEvent::key(0, 0, true)).await;
+                        core::future::pending::<()>().await;
+                    },
+                )
+                .await;
+                assert!(matches!(result, Either::First(None)));
+                assert!(start.elapsed() >= IDLE_RECONNECT_PAUSE + Duration::from_secs(2));
+                assert_eq!(attempted, has_saved_peer);
+            }
+        });
+    }
 }

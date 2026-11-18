@@ -75,6 +75,51 @@ fn sleep_fades_both_halves_to_black_before_suspending() {
 }
 
 #[test]
+fn peripheral_key_wake_flashes_once_and_fades_out() {
+    let mut state = IndicatorState::new(Role::Peripheral, 0);
+    let mut now = ACTIVITY;
+    state.set_sleeping(true);
+    state.update(now);
+    assert!(state.is_suspended());
+
+    state.flash_wake(now);
+    state.set_sleeping(false);
+    advance_frames(&mut state, &mut now, 8);
+    assert_eq!((state.cur_inner, state.cur_outer), (OFF, BLUE));
+    assert!(state.is_animating());
+
+    let expires_at = ACTIVITY + WAKE_FLASH;
+    assert_eq!(state.outer_effect(expires_at - 1), LightEffect::WakeFlash);
+    assert_eq!(state.outer_effect(expires_at), LightEffect::Off);
+    advance_frames(&mut state, &mut now, 20);
+    assert_eq!((state.cur_inner, state.cur_outer), (OFF, OFF));
+    assert!(!state.is_animating());
+}
+
+#[test]
+fn peripheral_connection_uses_the_normal_notice_with_or_without_a_key_wake() {
+    for manual_wake in [false, true] {
+        let mut state = IndicatorState::new(Role::Peripheral, 0);
+        let now = ACTIVITY;
+        state.set_sleeping(true);
+        state.update(now);
+        state.set_sleeping(false);
+        assert_eq!(state.outer_effect(now), LightEffect::Off);
+
+        if manual_wake {
+            state.flash_wake(now);
+            assert_eq!(state.outer_effect(now), LightEffect::WakeFlash);
+        }
+
+        let connected_at = now + ANIM_INTERVAL;
+        state.set_peer_connected(true, connected_at);
+        assert_eq!(state.outer_effect(connected_at), LightEffect::Solid(BLUE));
+        assert!(state.wake_flash_until <= connected_at);
+        assert_eq!(state.outer_effect(connected_at + NOTICE), LightEffect::Off);
+    }
+}
+
+#[test]
 fn connection_and_advertising_notices_restore_caps_lock() {
     let mut state = IndicatorState::new(Role::Central, 0);
     state.set_caps_lock(true);

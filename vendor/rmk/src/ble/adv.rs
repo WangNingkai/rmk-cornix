@@ -24,6 +24,8 @@ pub(crate) enum Adv<'a> {
     Host { name: &'a str },
     /// The split central that owns peripheral `id`.
     SplitPeripheral { id: u8 },
+    /// A split peripheral waiting for its saved central at a lower advertising rate.
+    IdleSplitPeripheral { id: u8 },
     /// An RMK dongle whose pairing window is open.
     DongleSeeking,
 }
@@ -45,7 +47,7 @@ impl Adv<'_> {
             // The two kinds below name themselves to another RMK device and nothing
             // else, undiscoverable: only RMK should act on these, and no host should
             // list them.
-            Self::SplitPeripheral { id } => &[
+            Self::SplitPeripheral { id } | Self::IdleSplitPeripheral { id } => &[
                 AdStructure::Flags(BR_EDR_NOT_SUPPORTED),
                 AdStructure::ManufacturerSpecificData {
                     company_identifier: RMK_ADV_COMPANY_ID,
@@ -95,9 +97,12 @@ impl Adv<'_> {
     /// A host link can afford a slow interval and gains from 2M; every other
     /// peer is RMK's own hardware, where reaching it fast matters more.
     fn params(&self) -> AdvertisementParameters {
-        let (phy, interval) = match self {
-            Self::Host { .. } => (PhyKind::Le2M, Duration::from_millis(200)),
-            _ => (PhyKind::Le1M, Duration::from_millis(50)),
+        let (phy, interval, filter_policy) = match self {
+            Self::Host { .. } => (PhyKind::Le2M, Duration::from_millis(200), AdvFilterPolicy::Unfiltered),
+            Self::IdleSplitPeripheral { .. } => {
+                (PhyKind::Le1M, Duration::from_millis(200), AdvFilterPolicy::FilterConn)
+            }
+            _ => (PhyKind::Le1M, Duration::from_millis(50), AdvFilterPolicy::Unfiltered),
         };
         AdvertisementParameters {
             primary_phy: phy,
@@ -105,6 +110,7 @@ impl Adv<'_> {
             tx_power: TxPower::Plus8dBm,
             interval_min: interval,
             interval_max: interval,
+            filter_policy,
             ..Default::default()
         }
     }
@@ -128,7 +134,7 @@ pub(crate) async fn advertise<'a, 'b, C: Controller, const ATT: usize, const CON
 
 #[cfg(test)]
 mod tests {
-    use super::Adv;
+    use super::*;
 
     /// Overrunning the 31-byte legacy advertisement only fails at runtime.
     fn fits(adv: Adv<'_>) -> bool {
@@ -155,6 +161,18 @@ mod tests {
             adv.build(&mut buf).unwrap();
             assert_eq!(Adv::decode(&buf), Some(adv));
         }
+    }
+
+    #[test]
+    fn idle_split_advertisement_uses_saved_peer_filter_and_the_same_payload() {
+        let idle = Adv::IdleSplitPeripheral { id: 2 };
+        let mut buf = [0; 31];
+        idle.build(&mut buf).unwrap();
+        assert_eq!(Adv::decode(&buf), Some(Adv::SplitPeripheral { id: 2 }));
+        let params = idle.params();
+        assert!(matches!(params.filter_policy, AdvFilterPolicy::FilterConn));
+        assert!(matches!(params.primary_phy, PhyKind::Le1M));
+        assert_eq!(params.interval_max, Duration::from_millis(200));
     }
 
     #[test]

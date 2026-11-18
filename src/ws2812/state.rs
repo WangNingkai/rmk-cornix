@@ -11,6 +11,7 @@ pub(super) const ANIM_INTERVAL: u64 = 33;
 pub(super) const IDLE_INTERVAL: u64 = 1000;
 const NOTICE: u64 = 3000;
 const ACTIVITY: u64 = 60_000;
+const WAKE_FLASH: u64 = 400;
 const LOW_ALERT: u64 = 5000;
 const LOW_QUIET: u64 = 5 * 60_000;
 const FADE_STEP: u8 = 3;
@@ -55,11 +56,12 @@ enum LightEffect {
     Solid(Grb),
     Breath(Grb),
     LowBattery,
+    WakeFlash,
 }
 
 impl LightEffect {
     fn is_animated(self) -> bool {
-        matches!(self, Self::Breath(_) | Self::LowBattery)
+        matches!(self, Self::Breath(_) | Self::LowBattery | Self::WakeFlash)
     }
 }
 
@@ -92,6 +94,7 @@ pub(super) struct IndicatorState {
 
     ble_since: u64,
     peer_since: u64,
+    wake_flash_until: u64,
     charge_since: u64,
     low_alert_until: u64,
     low_next_alert: u64,
@@ -119,6 +122,7 @@ impl IndicatorState {
             sleeping: false,
             ble_since: now,
             peer_since: now,
+            wake_flash_until: now,
             charge_since: now,
             low_alert_until: now,
             low_next_alert: now,
@@ -153,6 +157,16 @@ impl IndicatorState {
         if connected != self.peer_connected {
             self.peer_since = now;
             self.peer_connected = connected;
+            if connected {
+                self.wake_flash_until = now;
+            }
+            self.pending = true;
+        }
+    }
+
+    pub(super) fn flash_wake(&mut self, now: u64) {
+        if self.role == Role::Peripheral && !self.peer_connected {
+            self.wake_flash_until = now + WAKE_FLASH;
             self.pending = true;
         }
     }
@@ -227,6 +241,7 @@ impl IndicatorState {
             LightEffect::Off => OFF,
             LightEffect::Solid(color) => color,
             LightEffect::Breath(color) => self.breath_color(color, now),
+            LightEffect::WakeFlash => BLUE,
             LightEffect::LowBattery => {
                 if self.low_blink_on(now) {
                     CORAL
@@ -301,6 +316,8 @@ impl IndicatorState {
                     } else {
                         LightEffect::Off
                     }
+                } else if now < self.wake_flash_until {
+                    LightEffect::WakeFlash
                 } else if (now - self.peer_since) < ACTIVITY {
                     LightEffect::Breath(BLUE)
                 } else {

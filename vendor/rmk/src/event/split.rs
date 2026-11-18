@@ -23,6 +23,13 @@ pub struct CentralConnectedEvent {
     pub connected: bool,
 }
 
+/// 右半在等待低频重连时收到按键，恢复快速广播。
+#[cfg(feature = "_ble")]
+#[event]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PeripheralReconnectByKeyEvent;
+
 /// Peripheral battery status changed event
 #[event(channel_size = crate::PERIPHERAL_BATTERY_EVENT_CHANNEL_SIZE, pubs = crate::PERIPHERAL_BATTERY_EVENT_PUB_SIZE, subs = crate::PERIPHERAL_BATTERY_EVENT_SUB_SIZE)]
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, MaxSize)]

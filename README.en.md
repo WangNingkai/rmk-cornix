@@ -2,139 +2,92 @@
 
 [简体中文](README.md)
 
-This repository provides unofficial [RMK](https://rmk.rs/) firmware for the Jezail Funder Cornix keyboard.
-It uses RMK `0.9.0`, the nRF52840, and the Adafruit Bootloader.
+Unofficial [RMK](https://rmk.rs/) firmware for the Jezail Funder Cornix, based on RMK `0.9.0` and built for the nRF52840 with the Adafruit UF2 Bootloader.
 
-## Features and compatibility
+- The left half connects to the host over USB or Bluetooth. The right half connects to the left over Bluetooth.
+- Supports all keys, both rotary encoders, five Bluetooth profiles, and remapping in Vial.
+- Reports battery levels for both halves. The onboard WS2812 LEDs show battery, connection, and Caps Lock status.
 
-- Supports all keys, both rotary encoders, and keymap editing in Vial.
-- Reports battery levels for both halves. The onboard WS2812 LEDs indicate battery, connection, and Caps Lock status.
-- The Vial layout is broadly compatible with the stock firmware. You can import an existing `.vil` file. Check macros,
-  combos, Tap Dance, and encoder bindings individually and reconfigure them as needed.
-- The onboard RGB LEDs are reserved for status indicators.
+## Download and flash
 
-## Connection, power, and storage
+1. Export a Vial `.vil` backup and keep the previous UF2 files for both halves.
+2. Download the ZIP and `SHA256SUMS` for the same version from [GitHub Releases](https://github.com/WangNingkai/rmk-cornix/releases).
+3. Verify the ZIP in the download directory, then extract it.
 
-### Connection stability and input recovery
+   ```sh
+   # Linux
+   sha256sum -c SHA256SUMS
 
-- Split service discovery and writes have timeouts. The right half waits up to five seconds for a write. A failed or timed-out
-  write ends the session, disconnects the link, and lets the halves reconnect.
-- After a disconnect, the firmware waits for space in the event queue, releases held split keys, and then reconnects.
-- While the left half is asleep and a host connection is available, it still attempts to reconnect to the right half. Each
-  connection attempt or advertising wait lasts up to one second, followed by a five-second pause. Without a host connection,
-  the left half waits for wake-up before retrying.
-- Switching Bluetooth profiles clears held keys, temporary combo layers, modifiers, and mouse state. The firmware ignores
-  later releases from those keys and keeps explicitly selected persistent layers.
-- Reboot and Bootloader actions are forwarded to the half where the triggering key was pressed.
+   # macOS
+   shasum -a 256 -c SHA256SUMS
+   ```
 
-### Battery and power saving
+   On Windows, run `Get-FileHash .\rmk-cornix-*.zip -Algorithm SHA256` in PowerShell and compare the ZIP's hash with `SHA256SUMS`.
 
-- BLE uses 2M PHY and +8 dBm transmit power. The split central sleeps after two minutes of inactivity.
-- [`keyboard.toml`](keyboard.toml) configures both halves' battery ADC pins and voltage divider calibration. The default
-  sampling interval is five minutes.
-- Battery notifications wait for a new keypress to reduce unintended host wake-ups. Right-half notifications use the latest
-  cached reading at that point. When the host reads either battery level directly, the firmware refreshes that attribute from
-  the corresponding cache immediately.
-- Animations and fades refresh every 33 ms. The firmware checks steady or off LEDs once per second, and status events can
-  trigger an earlier refresh. During sleep both LEDs fade out, then the firmware cuts LED power and waits for events.
-- When the battery recovers, the firmware resets the low-battery reminder so it can alert immediately if the level falls again.
-  Breathing and blinking continue to refresh during their dark phases.
+4. Put each half into UF2 Bootloader mode and copy its UF2 file to the Bootloader drive. Use files from the same build on both halves.
 
-### Status LED tests and Flash protection
+   | File | Keyboard half |
+   | --- | --- |
+   | `rmk-cornix-central.uf2` | Left (central) |
+   | `rmk-cornix-peripheral.uf2` | Right (peripheral) |
 
-- The LED state machine runs independently of the hardware so host-side tests can exercise the same logic used by the firmware.
-- The firmware occupies `[0x1000, 0xA0000)`, a 636 KiB region. Configuration storage remains in `[0xA0000, 0xC0000)`,
-  which is 128 KiB across 32 sectors of 4 KiB each. The linker enforces the firmware limit to protect saved configuration.
-- Flash configuration has a format version. The firmware records it when initialization completes and retries on the next
-  boot if power is interrupted during initialization.
-- A failed Flash check or initialization is retried once at startup. If storage is still unavailable, Vial configuration and
-  Flash saving pause until the next boot.
-- CI checks formatting, Clippy, LED state, Flash partition boundaries, and the RMK library before building the firmware and UF2 files.
+The first upgrade from an older release to **storage format 1** clears the saved configuration and loads the default keymap. Remove the old Bluetooth pairing from your computer or phone, then pair again. With the default storage settings, future builds using the same format retain Vial settings and Bluetooth pairings.
 
-If you change the Flash layout, update both [`keyboard.toml`](keyboard.toml) and [`memory.x`](memory.x) and review how to
-migrate existing configuration. `vendor/rmk` and `vendor/rmk-macro` are based on the upstream `rmk-v0.9.0` tag. Review the
-local patches when upgrading RMK.
+For a test build, run **Build RMK firmware** manually in GitHub Actions and download the `rmk-cornix-firmware` artifact from that run.
 
-## Status LEDs
+## Usage
 
-Each half has two independently controlled WS2812 LEDs. The rows for each LED are in priority order. When a temporary
-indication expires, the LED resumes the next applicable state. Both LEDs fade out during sleep.
+### Vial and the default keymap
 
-### Left half (central)
+Connect the left half to your computer over USB, then open Vial.
+
+See [`keyboard.toml`](keyboard.toml) for the default keymap and encoder bindings. On the base layer, the left encoder controls volume and the right encoder changes tracks. The number, function, and Bluetooth layers inherit these actions. `MO(4)` opens the custom layer, which inherits lower-layer actions by default. The firmware uses saved bindings when available and loads the defaults when it initializes storage.
+
+You can import a `.vil` file exported from the stock firmware. Check keys, encoders, macros, combos, and Tap Dance after import and configure them as needed. When you change a key or encoder in Vial, the firmware applies the change and replies after a successful Flash write.
+
+### Bluetooth profiles and split reconnection
+
+- Tap a configured `BT0` through `BT4` key to switch profiles. Hold it for five seconds to clear that profile's old pairing and switch to it for pairing again. The timer keeps running when you release the layer key or use an ordinary key.
+- After fast advertising times out, the right half starts a repeating cycle. It waits 20 seconds, then advertises for up to eight seconds at 200 ms intervals. During these windows it accepts connections from the saved left-half address. Pressing a key on the right half resumes fast advertising immediately. If the right half has no saved left-half address, press one of its keys to start advertising again.
+- While the left half is asleep with a host connection, it keeps trying to reconnect to the right half. Each attempt lasts up to one second, followed by a five-second pause. When the left half is asleep without a host connection, press a key on the left half to wake it.
+
+### Status LEDs
+
+Each half has two status LEDs. For any one LED, the higher row in the table takes priority. When a temporary indication expires, the LED returns to the next applicable state. Both LEDs fade out during sleep.
 
 | LED | State | Indication |
 | --- | --- | --- |
-| Inner (right) | USB charging | Breathes green. At 95%, it stays green for three seconds, then turns off. |
-| Inner (right) | Low battery | At 20% or below, gives two coral flashes at a time for five seconds. The reminder repeats after a five-minute interval. |
-| Inner (right) | Split connection | Breathes blue for up to 60 seconds when disconnected. It stays blue for three seconds after connecting. |
-| Outer (left) | Bluetooth connection or profile switch | Shows the current profile color for three seconds. |
-| Outer (left) | Bluetooth advertising | Breathes in the current profile color for up to 60 seconds. |
-| Outer (left) | Caps Lock | Stays amber while Caps Lock is on. |
+| Both inner LEDs | USB charging | Breathes green. At 95%, it stays green for three seconds, then turns off. |
+| Both inner LEDs | Low battery | At 20% or below, flashes coral twice at a time for five seconds. It repeats after five minutes. |
+| Left inner and right outer | Split connection | Breathes blue for up to 60 seconds when disconnected. Stays blue for three seconds after connecting. |
+| Right outer | Key press during idle reconnect | Flashes blue once when a key press resumes fast advertising. |
+| Left outer | Bluetooth connection or profile switch | Shows the current profile color for three seconds. |
+| Left outer | Bluetooth advertising | Breathes in the current profile color for up to 60 seconds. |
+| Left outer | Caps Lock | Stays amber while Caps Lock is on. |
 
-Bluetooth profiles 1–5 use amethyst, emerald, sapphire, garnet, and diamond colors, in that order. Brightness is limited.
+On the left half, the inner LED is on the right and the outer LED is on the left. `BT0` through `BT4` use amethyst, emerald, sapphire, garnet, and diamond respectively. Breathing uses gamma correction.
 
-### Right half (peripheral)
+## Build from source
 
-| LED | State | Indication |
-| --- | --- | --- |
-| Inner | USB charging | Breathes green. At 95%, it stays green for three seconds, then turns off. |
-| Inner | Low battery | At 20% or below, gives two coral flashes at a time for five seconds. The reminder repeats after a five-minute interval. |
-| Outer | Split connection | Breathes blue for up to 60 seconds when disconnected. It stays blue for three seconds after connecting. |
+- Rust `stable`. See [`rust-toolchain.toml`](rust-toolchain.toml) for the target and components.
+- `cargo-make`. [`Makefile.toml`](Makefile.toml) defines the build tasks and installs tools such as `flip-link` and the UF2 converter as needed.
+- The ARM GNU bare-metal toolchain, including `arm-none-eabi-gcc`, `arm-none-eabi-ar`, and the newlib headers. Add its `bin` directory to `PATH` so the Bluetooth cryptography dependency can build.
 
-Breathing uses gamma correction, and LED states transition with a fade.
-
-## Building and flashing
-
-### Back up before upgrading
-
-Flash both halves with firmware from the same build. Upgrading from an older release to storage format 1 clears the saved
-configuration and loads the default keymap. Remove the old Bluetooth pairing from your computer or phone and pair again.
-Future builds using the same storage format retain Vial settings and Bluetooth pairings. You can export your Vial `.vil`
-configuration and keep the previous pair of UF2 files before flashing for restoration or rollback.
-
-### Build locally
-
-You need Rust `stable`, `flip-link`, `cargo-make`, and the UF2 conversion tools. The Rust components and target are listed in
-[`rust-toolchain.toml`](rust-toolchain.toml). The build tasks and tool installation steps are defined in
-[`Makefile.toml`](Makefile.toml).
-
-You also need the ARM GNU bare-metal toolchain, including `arm-none-eabi-gcc`, `arm-none-eabi-ar`, and the newlib headers.
-Add the toolchain's `bin` directory to `PATH` so the Bluetooth cryptography dependency can compile its C and assembly code.
-
-The default keys and encoders in [`keyboard.toml`](keyboard.toml) come from a Vial export. Encoders on the number, function,
-and Bluetooth layers inherit the base layer's volume and track controls. `MO(4)` opens the custom layer, which is transparent
-by default and can be configured in Vial. Saved bindings take priority until the firmware initializes storage.
-Edit the configuration as needed, then build the flashable files from the repository root.
+Run from the repository root.
 
 ```sh
 cargo make uf2
 ```
 
-### Download and flash
+The HEX and UF2 files appear in the repository root. Running `cargo build --release --locked` on its own produces both ELF files in `target/thumbv7em-none-eabihf/release/`.
 
-Download the versioned ZIP and `SHA256SUMS` from [GitHub Releases](https://github.com/WangNingkai/rmk-cornix/releases).
-Run `sha256sum -c SHA256SUMS` in the download directory (`shasum -a 256 -c SHA256SUMS` on macOS), then extract the ZIP.
-For a test build, run **Build RMK firmware** manually in GitHub Actions and download the `rmk-cornix-firmware` artifact
-from that run. Put each half in Bootloader mode and flash its corresponding UF2.
+The main configuration files are [`keyboard.toml`](keyboard.toml) for pins, bindings, battery ADC, and Bluetooth, [`vial.json`](vial.json) for the Vial layout, and [`memory.x`](memory.x) for the linker memory layout.
 
-| File | Use |
-| --- | --- |
-| `rmk-cornix-central.uf2` | Flash the left half (central) |
-| `rmk-cornix-peripheral.uf2` | Flash the right half (peripheral) |
-| `rmk-cornix-central.hex`, `rmk-cornix-peripheral.hex` | Intel HEX images for the corresponding halves |
+## Tests
 
-`cargo build --release --locked` creates the ELF files under `target/`. `cargo make uf2` also converts them to UF2.
+Run these commands from the repository root. [`build.yml`](.github/workflows/build.yml) defines the CI checks and firmware build.
 
-Pushing a `vMAJOR.MINOR.PATCH` tag triggers a release. After the checks and build pass, CI packages both UF2 files
-from that run into one ZIP and publishes it with the checksum file.
-
-For details on the RMK upgrade, see the [official migration guide](https://rmk.rs/docs/migration/v08_v09).
-
-## Checks and tests
-
-Run these commands from the repository root.
-
-### Firmware checks and build
+### Firmware checks
 
 ```sh
 cargo fmt --check
@@ -142,52 +95,59 @@ cargo clippy --release --bins --locked -- -D warnings
 cargo build --release --locked
 ```
 
-### Status LED tests
-
-Compile the firmware's LED state module on the host. You only need the Rust toolchain for these tests.
+### Status LEDs and Flash partitions
 
 ```sh
 mkdir -p target
 rustfmt --edition 2021 --check tests/ws2812.rs
 rustc --edition 2021 --test tests/ws2812.rs -o target/ws2812-tests
 ./target/ws2812-tests
-```
 
-The tests cover recurring low-battery alerts, sleep fade-out and paused polling, restoring Caps Lock after a temporary
-indication, charging priority, and refresh during dark animation phases. Check PWM timing and power draw on the hardware.
-
-### Flash partitions and linker limits
-
-This test requires Python 3.11+ and `arm-none-eabi-as` and `arm-none-eabi-ld` from the ARM GNU toolchain.
-
-```sh
 python3 tests/test_memory_layout.py
 ```
 
-It checks that `keyboard.toml` and `memory.x` agree and uses the actual linker script to verify that a firmware image at the
-exact size limit links successfully and a one-byte overflow is rejected.
+The LED tests compile the firmware's actual state logic on the host. They cover low-battery alerts, sleep fade-out, indication priority, and animation refresh. The Flash tests require Python 3.11+, `arm-none-eabi-as`, and `arm-none-eabi-ld`. They check the partition configuration and confirm that an image at the size limit links successfully and a one-byte overflow fails.
 
-### RMK library tests
+### RMK unit and integration tests
 
-Install `cargo-nextest 0.9.152` to isolate tests that use the same simulated clock. The tests use `tests/rmk.toml`.
-Use your host's target triple. The example is for Apple Silicon macOS. Linux CI uses `x86_64-unknown-linux-gnu`.
+Use `cargo-nextest 0.9.152` to isolate tests that share a simulated clock. This example uses the Apple Silicon macOS target. Linux CI uses `x86_64-unknown-linux-gnu`.
 
 ```sh
 KEYBOARD_TOML_PATH="$PWD/tests/rmk.toml" cargo nextest run \
   --manifest-path vendor/rmk/Cargo.toml --target aarch64-apple-darwin \
-  --no-default-features --features std,log,split,_ble,vial,storage --lib
+  --no-default-features --features std,log,split,_ble,vial,storage --lib --test integration
 ```
 
 ### Hardware checks
 
-- Check both halves' keys and encoders, and save and restore the Vial configuration.
-- Flash two independent builds using the same storage format and verify that custom Vial bindings and Bluetooth pairings persist.
-- Check battery readings, notification timing, and status LED priority on both halves.
-- Switch Bluetooth profiles, reboot either half, and check reconnection after a disconnect.
-- Keep the left half connected to a Bluetooth host, turn off the right half, and wait for the left half to sleep. Turn the right
-  half back on using only its power switch. Check that input resumes, and record the time to reconnect and the left half's power
-  draw while the right half is offline.
-- Leave the right half powered, turn off the left half for about six minutes, then turn it back on. Leave the right half's keys
-  untouched and record whether it reconnects on its own and how long it takes.
-- Check for unintended host wake-ups and verify the first keystroke after keyboard sleep.
-- Measure the LED PWM waveform and actual power consumption.
+- [ ] Check Bluetooth pairing and wake-up on the target devices. Check wired input, Vial save and restore, both halves' keys, and both encoders.
+- [ ] Flash two independent builds using the same storage format and verify that Vial key and encoder bindings and Bluetooth pairings persist.
+- [ ] Tap a Bluetooth profile key to switch profiles. Hold the profile key and release the layer key during the hold. Verify that pairing is available after five seconds.
+- [ ] Keep the left half connected to a host and let it sleep, then turn on the right half. Check that input resumes automatically, and record reconnection time and left-half power draw.
+- [ ] Leave the right half on and turn the left half off for about six minutes. Turn the left half back on and leave the right half's keys untouched. Record automatic reconnection time and right-half standby current, and check for the normal connection indication. Then check that pressing a key during the wait flashes blue once and resumes fast advertising.
+- [ ] Check both battery readings, notification timing, LED priority, and PWM waveforms. Check for unintended host wake-ups and verify the first key after keyboard sleep.
+
+## Firmware details
+
+- Split service discovery and writes have timeouts. The right half has up to five seconds to write, and it disconnects and reconnects on failure. After losing the link, the firmware waits for event queue space and releases split keys before reconnecting.
+- Switching Bluetooth profiles clears held keys, temporary layers, modifiers, and mouse state. The firmware keeps persistent layers and ignores later releases from the keys it just cleared. Reboot and Bootloader actions are sent to the half where the triggering key was pressed.
+- Bluetooth connections request 2M PHY as configured. Split advertising uses 1M PHY, transmit power is set to +8 dBm, and the left half sleeps after two minutes of inactivity.
+- The battery ADCs sample every five minutes by default. Notifications wait for a new key press, and direct reads use the latest cached reading. Animations and fades refresh every 33 ms. Steady LEDs are checked once per second. After fading out in sleep, the LEDs power off and polling pauses.
+- Flash initialization writes the format marker after saving the defaults. An interruption during initialization is retried on the next boot. A Flash check or initialization error is retried once. If storage still fails, Vial configuration and Flash writes pause for that boot. VIA bulk keymap reads and writes validate length, offset, and range.
+
+| Flash region | Address range | Size |
+| --- | --- | --- |
+| Firmware | `[0x1000, 0xA0000)` | 636 KiB |
+| Configuration storage | `[0xA0000, 0xC0000)` | 128 KiB, 32 sectors of 4 KiB |
+
+The linker enforces the firmware size limit. If you change the partitions, update [`keyboard.toml`](keyboard.toml) and [`memory.x`](memory.x) together and check how saved configurations will migrate.
+
+## Releases
+
+Pushing a `vMAJOR.MINOR.PATCH` tag starts a release build. Once checks and builds pass, CI packages both UF2 files from that build in a single ZIP and publishes it with `SHA256SUMS`.
+
+[`vendor/rmk`](vendor/rmk) and [`vendor/rmk-macro`](vendor/rmk-macro) are based on the upstream `rmk-v0.9.0` tag and include Cornix-specific changes. Review the local patches and the [official RMK migration guide](https://rmk.rs/docs/migration/v08_v09) when upgrading RMK.
+
+## License
+
+The project declares `MIT OR Apache-2.0` in [`Cargo.toml`](Cargo.toml). The vendored RMK license texts are available under [MIT](vendor/rmk/LICENSE-MIT) and [Apache-2.0](vendor/rmk/LICENSE-APACHE).

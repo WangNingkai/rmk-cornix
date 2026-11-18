@@ -1,7 +1,5 @@
 use core::fmt::Debug;
 
-#[cfg(feature = "_ble")]
-use embassy_futures::select::{Either, select};
 use embassy_futures::yield_now;
 #[cfg(feature = "_ble")]
 use embassy_sync::signal::Signal;
@@ -146,27 +144,26 @@ impl Runnable for Keyboard<'_> {
     /// The report is sent using `send_report`.
     async fn run(&mut self) -> ! {
         loop {
-            // TODO: Now the unprocessed_events is only used in held_for_5s.
-            // Maybe it can be removed in the future?
-            if !self.unprocessed_events.is_empty() {
-                // Process unprocessed events
-                let e = self.unprocessed_events.remove(0);
-                debug!("Unprocessed event: {:?}", e);
-                self.process_inner(e).await
-            } else if let Some(key) = self.next_buffered_key() {
+            if let Some(key) = self.next_buffered_key() {
                 // Process buffered held key
                 self.process_buffered_key(key).await
             } else {
-                // If a mouse repeat or one-shot expiry is pending, race subscriber against the earliest deadline
-                let deadline = [self.mouse.next_deadline(), self.osm_deadline, self.osl_deadline]
-                    .into_iter()
-                    .flatten()
-                    .min();
+                let deadline = [
+                    self.mouse.next_deadline(),
+                    self.osm_deadline,
+                    self.osl_deadline,
+                    #[cfg(feature = "_ble")]
+                    self.ble_key_hold.map(|hold| hold.deadline),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
                 let event = if let Some(deadline) = deadline {
                     match with_deadline(deadline, self.keyboard_event_subscriber.next_message_pure()).await {
                         Ok(event) => event,
                         Err(_) => {
-                            // Deadline expired: fire pending one-shot expiry and/or mouse repeat
+                            #[cfg(feature = "_ble")]
+                            self.fire_ble_key_hold().await;
                             self.fire_oneshot_timeout().await;
                             if self.mouse.next_deadline().is_some_and(|d| d <= Instant::now()) {
                                 self.fire_mouse_repeat().await;
@@ -189,6 +186,14 @@ impl Runnable for Keyboard<'_> {
     }
 }
 
+#[cfg(feature = "_ble")]
+#[derive(Clone, Copy)]
+struct BleKeyHold {
+    pos: KeyboardEventPos,
+    id: u8,
+    deadline: Instant,
+}
+
 pub struct Keyboard<'a> {
     /// Keymap
     pub(crate) keymap: &'a KeyMap<'a>,
@@ -208,8 +213,8 @@ pub struct Keyboard<'a> {
     // shortcut: 最多跟踪 64 个同时按下的位置；更大并发输入需扩大容量。
     pressed_positions: Vec<(KeyboardEventPos, bool), 64>,
 
-    /// Unprocessed events
-    pub unprocessed_events: Vec<KeyboardEvent, 4>,
+    #[cfg(feature = "_ble")]
+    ble_key_hold: Option<BleKeyHold>,
 
     /// Buffered held keys
     pub held_buffer: HeldBuffer,
@@ -298,7 +303,8 @@ impl<'a> Keyboard<'a> {
             macro_caps: false,
             fork_states: [None; FORK_MAX_NUM],
             fork_keep_mask: ModifierCombination::default(),
-            unprocessed_events: Vec::new(),
+            #[cfg(feature = "_ble")]
+            ble_key_hold: None,
             held_buffer: HeldBuffer::new(),
             registered_keys: [None; 6],
             held_modifiers: ModifierCombination::default(),
@@ -407,6 +413,10 @@ impl<'a> Keyboard<'a> {
 
     /// Process key changes at (row, col)
     pub async fn process_inner(&mut self, event: KeyboardEvent) {
+        #[cfg(feature = "_ble")]
+        if !event.pressed && self.ble_key_hold.is_some_and(|hold| hold.pos == event.pos) {
+            self.ble_key_hold = None;
+        }
         #[cfg(feature = "_ble")]
         if event.pressed {
             let sequence = KEY_PRESS_SEQUENCE
@@ -1741,23 +1751,43 @@ impl<'a> Keyboard<'a> {
         }
     }
 
-    /// True when the key is still down 5s later. A release inside the window is
-    /// pushed back to `unprocessed_events`, so it replays as a short press.
     #[cfg(feature = "_ble")]
-    async fn held_for_5s(&mut self) -> bool {
-        match select(
-            embassy_time::Timer::after_millis(5000),
-            self.keyboard_event_subscriber.next_message_pure(),
-        )
-        .await
+    async fn fire_ble_key_hold(&mut self) {
+        use crate::NUM_BLE_PROFILE;
+        use crate::ble::profile::BleProfileAction;
+        use crate::channel::BLE_PROFILE_CHANNEL;
+
+        let Some(hold) = self.ble_key_hold.filter(|hold| hold.deadline <= Instant::now()) else {
+            return;
+        };
+        self.ble_key_hold = None;
+        if !self
+            .pressed_positions
+            .iter()
+            .any(|&(pos, suppressed)| pos == hold.pos && !suppressed)
         {
-            Either::First(_) => true,
-            Either::Second(e) => {
-                if self.unprocessed_events.push(e).is_err() {
-                    warn!("Unprocessed event queue is full, dropping event");
-                }
-                false
-            }
+            return;
+        }
+        let id = hold.id;
+        if id < NUM_BLE_PROFILE as u8 {
+            info!("Profile key held: clearing bond on profile {}", id);
+            self.release_active_keyboard_state().await;
+            BLE_PROFILE_CHANNEL.send(BleProfileAction::ClearSlot(id)).await;
+            BLE_PROFILE_CHANNEL.send(BleProfileAction::Switch(id)).await;
+        }
+        #[cfg(feature = "dongle")]
+        if id == NUM_BLE_PROFILE as u8 + 5 {
+            use crate::ble::profile::DONGLE_PROFILE;
+            info!("Dongle key held: clearing dongle bond, seeking a dongle");
+            BLE_PROFILE_CHANNEL
+                .send(BleProfileAction::ClearSlot(DONGLE_PROFILE))
+                .await;
+            BLE_PROFILE_CHANNEL.send(BleProfileAction::Switch(DONGLE_PROFILE)).await;
+        }
+        #[cfg(feature = "split")]
+        if id == NUM_BLE_PROFILE as u8 + 4 {
+            publish_event(ClearPeerEvent);
+            info!("Clear peer");
         }
     }
 
@@ -1794,7 +1824,10 @@ impl<'a> Keyboard<'a> {
         if let Some(&layer) = self.osl_state.value() {
             self.keymap.deactivate_layer(layer);
         }
-        self.unprocessed_events.clear();
+        #[cfg(feature = "_ble")]
+        {
+            self.ble_key_hold = None;
+        }
         let combo_actions: Vec<Action, COMBO_MAX_NUM> = self.keymap.with_combos_mut(|combos| {
             let mut actions = Vec::new();
             for combo in combos.iter_mut().flatten() {
@@ -1839,30 +1872,16 @@ impl<'a> Keyboard<'a> {
             use crate::ble::profile::BleProfileAction;
             use crate::channel::BLE_PROFILE_CHANNEL;
             if event.pressed {
-                // The uniform gesture across all bond slots: tap switches, a 5s
-                // hold forgets the slot's bond and re-pairs. Holding a profile key
-                // clears that profile and switches to it, so it advertises openly.
-                if id < NUM_BLE_PROFILE as u8 && self.held_for_5s().await {
-                    info!("Profile key held: clearing bond on profile {}", id);
-                    self.release_active_keyboard_state().await;
-                    BLE_PROFILE_CHANNEL.send(BleProfileAction::ClearSlot(id)).await;
-                    BLE_PROFILE_CHANNEL.send(BleProfileAction::Switch(id)).await;
-                }
-                // A 5s hold of the dongle key clears the local dongle bond and goes
-                // seeking, which is how a keyboard moves to a different dongle.
-                #[cfg(feature = "dongle")]
-                if id == NUM_BLE_PROFILE as u8 + 5 && self.held_for_5s().await {
-                    use crate::ble::profile::DONGLE_PROFILE;
-                    info!("Dongle key held: clearing dongle bond, seeking a dongle");
-                    BLE_PROFILE_CHANNEL
-                        .send(BleProfileAction::ClearSlot(DONGLE_PROFILE))
-                        .await;
-                    BLE_PROFILE_CHANNEL.send(BleProfileAction::Switch(DONGLE_PROFILE)).await;
-                }
-                #[cfg(feature = "split")]
-                if id == NUM_BLE_PROFILE as u8 + 4 && self.held_for_5s().await {
-                    publish_event(ClearPeerEvent);
-                    info!("Clear peer");
+                if id < NUM_BLE_PROFILE as u8
+                    || (cfg!(feature = "split") && id == NUM_BLE_PROFILE as u8 + 4)
+                    || (cfg!(feature = "dongle") && id == NUM_BLE_PROFILE as u8 + 5)
+                {
+                    // 同时按下多个配对键时跟踪第一个，避免连续清除多个配对。
+                    self.ble_key_hold.get_or_insert(BleKeyHold {
+                        pos: event.pos,
+                        id,
+                        deadline: Instant::now() + Duration::from_secs(5),
+                    });
                 }
             } else {
                 // Other user keys are processed when released.
@@ -2279,6 +2298,59 @@ mod test {
 
     fn create_test_keyboard() -> Keyboard<'static> {
         create_test_keyboard_with_config(BehaviorConfig::default())
+    }
+
+    #[cfg(feature = "_ble")]
+    #[test]
+    fn profile_key_hold_survives_layer_release_and_short_press_still_switches() {
+        use crate::ble::profile::BleProfileAction;
+        use crate::channel::BLE_PROFILE_CHANNEL;
+        use crate::event::{AsyncEventPublisher, AsyncPublishableEvent};
+        use embassy_futures::select::select;
+        use embassy_time::with_timeout;
+
+        let mut keyboard = create_test_keyboard();
+        keyboard
+            .keymap
+            .set_action_at(KeyboardEvent::key(0, 0, true).pos, 0, mo!(1));
+        keyboard.keymap.set_action_at(
+            KeyboardEvent::key(0, 1, true).pos,
+            1,
+            KeyAction::Single(Action::User(0)),
+        );
+        let sender = KeyboardEvent::publisher_async().unwrap();
+
+        block_on(select(keyboard.run(), async {
+            sender.publish_async(KeyboardEvent::key(0, 0, true)).await;
+            sender.publish_async(KeyboardEvent::key(0, 1, true)).await;
+            Timer::after_millis(100).await;
+            sender.publish_async(KeyboardEvent::key(0, 0, false)).await;
+            assert!(matches!(
+                with_timeout(Duration::from_secs(6), BLE_PROFILE_CHANNEL.receive()).await,
+                Ok(BleProfileAction::ClearSlot(0))
+            ));
+            assert!(matches!(
+                BLE_PROFILE_CHANNEL.receive().await,
+                BleProfileAction::Switch(0)
+            ));
+            sender.publish_async(KeyboardEvent::key(0, 1, false)).await;
+            Timer::after_millis(10).await;
+            assert!(BLE_PROFILE_CHANNEL.try_receive().is_err());
+
+            sender.publish_async(KeyboardEvent::key(0, 0, true)).await;
+            sender.publish_async(KeyboardEvent::key(0, 1, true)).await;
+            sender.publish_async(KeyboardEvent::key(0, 1, false)).await;
+            sender.publish_async(KeyboardEvent::key(0, 0, false)).await;
+            assert!(matches!(
+                with_timeout(Duration::from_secs(1), BLE_PROFILE_CHANNEL.receive()).await,
+                Ok(BleProfileAction::Switch(0))
+            ));
+            assert!(
+                with_timeout(Duration::from_secs(5), BLE_PROFILE_CHANNEL.receive())
+                    .await
+                    .is_err()
+            );
+        }));
     }
 
     #[test]

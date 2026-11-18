@@ -4,7 +4,8 @@ use embassy_time::{Duration, Instant, Timer};
 use rmk::embassy_futures::select::{select, Either};
 use rmk::event::{
     BatteryStatusEvent, CentralConnectedEvent, ChargingStateEvent, ConnectionStatusChangeEvent,
-    EventSubscriber, LedIndicatorEvent, PeripheralConnectedEvent, SleepStateEvent,
+    EventSubscriber, LedIndicatorEvent, PeripheralConnectedEvent, PeripheralReconnectByKeyEvent,
+    SleepStateEvent,
 };
 use rmk::processor::{PollingProcessor, Processor};
 use rmk::types::battery::BatteryStatus;
@@ -26,7 +27,7 @@ const SEQ_LEN: usize = SEQ_BITS + SEQ_RESET;
 
 #[rmk::macros::processor(subscribe = [
     BatteryStatusEvent, ChargingStateEvent, PeripheralConnectedEvent, CentralConnectedEvent,
-    ConnectionStatusChangeEvent, LedIndicatorEvent, SleepStateEvent,
+    ConnectionStatusChangeEvent, LedIndicatorEvent, SleepStateEvent, PeripheralReconnectByKeyEvent,
 ])]
 pub struct Ws2812Indicator {
     pwm: SequencePwm<'static>,
@@ -124,6 +125,10 @@ impl Ws2812Indicator {
             self.state
                 .set_peer_connected(event.connected, Instant::now().as_millis());
         }
+    }
+
+    async fn on_peripheral_reconnect_by_key_event(&mut self, _: PeripheralReconnectByKeyEvent) {
+        self.state.flash_wake(Instant::now().as_millis());
     }
 
     async fn on_connection_status_change_event(&mut self, event: ConnectionStatusChangeEvent) {
