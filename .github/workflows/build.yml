@@ -42,6 +42,15 @@ jobs:
       - name: Run clippy
         run: cargo clippy --release --bins -- -D warnings
 
+      - name: Test status LED state
+        run: |
+          rustfmt --edition 2021 --check tests/ws2812.rs
+          rustc --edition 2021 --test tests/ws2812.rs -o target/ws2812-tests
+          ./target/ws2812-tests
+
+      - name: Check flash layout
+        run: python3 tests/test_memory_layout.py
+
       - name: Run RMK library tests
         env:
           KEYBOARD_TOML_PATH: ${{ github.workspace }}/tests/rmk.toml

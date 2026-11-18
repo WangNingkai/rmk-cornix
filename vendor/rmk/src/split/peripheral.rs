@@ -15,7 +15,7 @@ use {
 };
 
 use super::SplitMessage;
-use super::driver::{SplitReader, SplitWriter};
+use super::driver::{SplitDriverError, SplitReader, SplitWriter};
 use crate::event::{
     KeyboardEvent, LayerChangeEvent, LedIndicatorEvent, PointingEvent, SleepStateEvent, SubscribableEvent,
     publish_event,
@@ -50,7 +50,9 @@ pub async fn run_rmk_split_peripheral<
     {
         let mut peripheral = SplitPeripheral::new(SerialSplitDriver::new(serial));
         loop {
-            peripheral.run().await;
+            if let Err(e) = peripheral.run().await {
+                error!("Split peripheral session failed: {:?}", e);
+            }
         }
     }
 
@@ -85,16 +87,13 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
     ///
     /// The peripheral uses the general matrix, does scanning and sends key events through `SplitWriter`.
     /// It also receives split messages from the central through `SplitReader`.
-    pub(crate) async fn run(&mut self) {
+    pub(crate) async fn run(&mut self) -> Result<(), SplitDriverError> {
         // Proactively announce our firmware hash so the central can detect
         // us even when it booted first and already gave up waiting for a query response.
         #[cfg(feature = "dfu_split")]
         {
             let hash = crate::dfu::read_embedded_firmware_hash();
-            self.split_driver
-                .write(&SplitMessage::FirmwareHashResponse(hash))
-                .await
-                .ok();
+            write_message(&mut self.split_driver, &SplitMessage::FirmwareHashResponse(hash)).await?;
         }
 
         let mut key_sub = KeyboardEvent::subscriber();
@@ -128,12 +127,13 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                             update_status(|c| *c = status);
                             // The central sends this only after subscribing to split notifications.
                             #[cfg(feature = "_ble")]
-                            self.split_driver
-                                .write(&SplitMessage::BatteryStatus(
+                            write_message(
+                                &mut self.split_driver,
+                                &SplitMessage::BatteryStatus(
                                     crate::input_device::battery::current_battery_status().into(),
-                                ))
-                                .await
-                                .ok();
+                                ),
+                            )
+                            .await?;
                         }
                         #[cfg(all(feature = "_ble", feature = "storage"))]
                         SplitMessage::ClearPeer => {
@@ -172,10 +172,7 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                         SplitMessage::FirmwareHashQuery => {
                             let hash = crate::dfu::read_embedded_firmware_hash();
                             info!("dfu_split: hash query, responding with {:#x}", hash);
-                            self.split_driver
-                                .write(&SplitMessage::FirmwareHashResponse(hash))
-                                .await
-                                .ok();
+                            write_message(&mut self.split_driver, &SplitMessage::FirmwareHashResponse(hash)).await?;
                         }
                         #[cfg(feature = "dfu_split")]
                         SplitMessage::FirmwareChunk { offset, len, data } => {
@@ -196,7 +193,7 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                                         offset,
                                         crc: crate::crc32::crc32(chunk_data),
                                     };
-                                    self.split_driver.write(&ack).await.ok();
+                                    write_message(&mut self.split_driver, &ack).await?;
                                 }
                                 Err(()) => error!("dfu_split: write error at offset {}", offset),
                             }
@@ -207,7 +204,7 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                                 let dfu_crc = handler.compute_dfu_crc();
                                 info!("dfu_split: DFU partition CRC: {:#010x}", dfu_crc);
                                 let crc_msg = SplitMessage::FirmwareCrcReport(dfu_crc);
-                                self.split_driver.write(&crc_msg).await.ok();
+                                write_message(&mut self.split_driver, &crc_msg).await?;
                                 info!("dfu_split: CRC report sent");
 
                                 let deadline = embassy_time::Instant::now() + embassy_time::Duration::from_secs(5);
@@ -234,7 +231,7 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                                 };
 
                                 if ok {
-                                    self.split_driver.write(&SplitMessage::FirmwareUpdateConfirm).await.ok();
+                                    write_message(&mut self.split_driver, &SplitMessage::FirmwareUpdateConfirm).await?;
                                     embassy_time::Timer::after_millis(50).await;
                                     handler.mark_updated_and_reset().ok();
                                 } else {
@@ -255,9 +252,130 @@ impl<S: SplitWriter + SplitReader> SplitPeripheral<S> {
                 },
                 Either::Second(e) => {
                     debug!("Writing split message {:?} to central", e);
-                    self.split_driver.write(&e).await.ok();
+                    write_message(&mut self.split_driver, &e).await?;
                 }
             }
         }
+        Ok(())
+    }
+}
+
+// 右半所有写入共用超时，避免按键或握手回复阻塞断线恢复。
+async fn write_message(driver: &mut impl SplitWriter, message: &SplitMessage) -> Result<usize, SplitDriverError> {
+    #[cfg(feature = "_ble")]
+    {
+        embassy_time::with_timeout(embassy_time::Duration::from_secs(5), driver.write(message))
+            .await
+            .map_err(|_| SplitDriverError::Disconnected)?
+    }
+    #[cfg(not(feature = "_ble"))]
+    driver.write(message).await
+}
+
+#[cfg(all(test, feature = "_ble", not(feature = "dfu_split")))]
+mod tests {
+    use core::cell::RefCell;
+    use std::rc::Rc;
+
+    use embassy_time::{Duration, with_timeout};
+    use rmk_types::connection::ConnectionStatus;
+
+    use super::*;
+    use crate::split::driver::SplitDriverError;
+    use crate::test_support::test_block_on;
+
+    enum WriteMode {
+        Blocked,
+        Failed,
+        Healthy,
+    }
+
+    struct TestDriver {
+        incoming: Option<SplitMessage>,
+        mode: WriteMode,
+        sent: Rc<RefCell<std::vec::Vec<SplitMessage>>>,
+    }
+
+    impl SplitReader for TestDriver {
+        async fn read(&mut self) -> Result<SplitMessage, SplitDriverError> {
+            match self.incoming.take() {
+                Some(message) => Ok(message),
+                None => core::future::pending().await,
+            }
+        }
+    }
+
+    impl SplitWriter for TestDriver {
+        async fn write(&mut self, message: &SplitMessage) -> Result<usize, SplitDriverError> {
+            self.sent.borrow_mut().push(*message);
+            match self.mode {
+                WriteMode::Blocked => core::future::pending().await,
+                WriteMode::Failed => Err(SplitDriverError::BleError(1)),
+                WriteMode::Healthy => Ok(1),
+            }
+        }
+    }
+
+    fn failed_session_exits(mode: WriteMode, battery_reply: bool) {
+        test_block_on(async {
+            let sent = Rc::new(RefCell::new(std::vec::Vec::new()));
+            let mut peripheral = SplitPeripheral::new(TestDriver {
+                incoming: battery_reply.then(|| SplitMessage::ConnectionStatus(ConnectionStatus::new())),
+                mode,
+                sent: sent.clone(),
+            });
+            let mut run = core::pin::pin!(peripheral.run());
+            if !battery_reply {
+                assert!(futures::poll!(run.as_mut()).is_pending());
+                publish_event(KeyboardEvent::key(0, 0, true));
+            }
+            assert!(
+                matches!(with_timeout(Duration::from_secs(6), run).await, Ok(Err(_))),
+                "发送异常后应带错误退出会话以便重连"
+            );
+            assert_eq!(sent.borrow().len(), 1);
+            assert_eq!(
+                matches!(sent.borrow()[0], SplitMessage::BatteryStatus(_)),
+                battery_reply
+            );
+        });
+    }
+
+    #[test]
+    fn blocked_key_write_exits_session() {
+        failed_session_exits(WriteMode::Blocked, false);
+    }
+
+    #[test]
+    fn blocked_battery_reply_exits_session() {
+        failed_session_exits(WriteMode::Blocked, true);
+    }
+
+    #[test]
+    fn failed_writes_exit_session() {
+        failed_session_exits(WriteMode::Failed, false);
+        failed_session_exits(WriteMode::Failed, true);
+    }
+
+    #[test]
+    fn healthy_writes_keep_processing_press_and_release() {
+        test_block_on(async {
+            let sent = Rc::new(RefCell::new(std::vec::Vec::new()));
+            let mut peripheral = SplitPeripheral::new(TestDriver {
+                incoming: None,
+                mode: WriteMode::Healthy,
+                sent: sent.clone(),
+            });
+            let mut run = core::pin::pin!(peripheral.run());
+            assert!(futures::poll!(run.as_mut()).is_pending());
+            for pressed in [true, false] {
+                publish_event(KeyboardEvent::key(0, 0, pressed));
+                assert!(futures::poll!(run.as_mut()).is_pending());
+            }
+            let sent = sent.borrow();
+            assert_eq!(sent.len(), 2);
+            assert!(matches!(sent[0], SplitMessage::Key(event) if event.pressed));
+            assert!(matches!(sent[1], SplitMessage::Key(event) if !event.pressed));
+        });
     }
 }

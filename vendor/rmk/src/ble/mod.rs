@@ -489,27 +489,13 @@ async fn gatt_events_task(server: &Server<'_>, conn: &GattConnection<'_, '_, Def
                 let mut cccd_updated = false;
                 let result = match &gatt_event {
                     GattEvent::Read(event) => {
-                        if event.handle() == level.handle {
-                            let value = server.get(&level);
-                            debug!("Read GATT Event to Level: {:?}", value);
-                        } else {
-                            #[cfg(feature = "split")]
-                            let peripheral_level =
-                                peripheral_levels.iter().find(|level| event.handle() == level.handle);
-                            #[cfg(not(feature = "split"))]
-                            let peripheral_level: Option<&Characteristic<u8>> = None;
-                            if let Some(peripheral_level) = peripheral_level {
-                                let value = server.get(peripheral_level);
-                                debug!("Read GATT Event to Peripheral Level: {:?}", value);
-                            } else {
-                                debug!("Read GATT Event to Unknown: {:?}", event.handle());
-                            }
-                        }
-
-                        if conn.raw().security_level()?.encrypted() {
-                            None
-                        } else {
+                        if !conn.raw().security_level()?.encrypted() {
                             Some(AttErrorCode::INSUFFICIENT_ENCRYPTION)
+                        } else if let Err(e) = battery_service::refresh_battery_level(server, event.handle()) {
+                            error!("Failed to refresh battery level: {:?}", e);
+                            Some(AttErrorCode::UNLIKELY_ERROR)
+                        } else {
+                            None
                         }
                     }
                     GattEvent::Write(event) => {

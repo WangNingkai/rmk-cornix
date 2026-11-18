@@ -3,3 +3,28 @@
 [rmk]
 split_peripherals_num = 1
 auto_mouse_layer_max_num = 4
+
+# 为宿主电量读取测试提供一个带电池的右半。
+[split]
+connection = "ble"
+
+[split.central]
+rows = 1
+cols = 1
+row_offset = 0
+col_offset = 0
+
+[split.central.matrix]
+row_pins = ["P0_01"]
+col_pins = ["P0_02"]
+
+[[split.peripheral]]
+rows = 1
+cols = 1
+row_offset = 1
+col_offset = 0
+battery_adc_pin = "P0_05"
+
+[split.peripheral.matrix]
+row_pins = ["P0_01"]
+col_pins = ["P0_02"]

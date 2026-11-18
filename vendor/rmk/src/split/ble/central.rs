@@ -6,7 +6,7 @@ use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Timer, with_timeout};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use trouble_host::prelude::*;
 
 use super::GattSplitMessage;
@@ -24,6 +24,9 @@ use crate::split::{PeripheralMatrixConfig, SPLIT_MESSAGE_MAX_SIZE, SplitMessage}
 use crate::storage::FlashOperationMessage;
 
 static PERIPHERAL_FOUND: Signal<crate::RawMutex, (u8, BdAddr)> = Signal::new();
+
+const SLEEP_RECONNECT_PAUSE: Duration = Duration::from_secs(5);
+const SLEEP_RECONNECT_WINDOW: Duration = Duration::from_secs(1);
 
 /// One peripheral link's lifecycle, owned by [`scan_and_connect_peripherals`].
 enum SlotState {
@@ -61,6 +64,7 @@ pub(crate) async fn scan_and_connect_peripherals<'a, C: Controller + ControllerC
 
     let mut central = stack.central();
     wait_for_stack_started().await;
+    let mut retry_at = Instant::now();
     loop {
         // Mark ended sessions `Disconnected`.
         while let Ok(id) = ended.try_receive() {
@@ -68,6 +72,15 @@ pub(crate) async fn scan_and_connect_peripherals<'a, C: Controller + ControllerC
                 peripheral_slots[id] = SlotState::Disconnected(addr);
             }
         }
+
+        if peripheral_slots.iter().all(|s| matches!(s, SlotState::Connected(_))) {
+            ended.ready_to_receive().await;
+            continue;
+        }
+        if !wait_before_reconnect(ended, retry_at).await {
+            continue;
+        }
+        let sleeping = crate::state::current_sleep_state();
 
         // Put every pending address in one accept list: the controller connects
         // to whichever peripheral answers first, so an absent one doesn't block
@@ -90,7 +103,12 @@ pub(crate) async fn scan_and_connect_peripherals<'a, C: Controller + ControllerC
                 },
             };
             info!("Start connecting, {} peripheral(s) pending", pending.len());
-            let connected = match with_timeout(Duration::from_secs(15), central.connect(&config)).await {
+            let connect_timeout = if sleeping {
+                SLEEP_RECONNECT_WINDOW
+            } else {
+                Duration::from_secs(15)
+            };
+            match with_timeout(connect_timeout, central.connect(&config)).await {
                 Ok(Ok(conn)) => {
                     let peer = conn.peer_address();
                     if let Some(&(id, addr)) = pending.iter().find(|(_, addr)| Address::random(*addr) == peer) {
@@ -100,18 +118,16 @@ pub(crate) async fn scan_and_connect_peripherals<'a, C: Controller + ControllerC
                     } else {
                         warn!("Connected peer {:?} matches no pending slot", peer.addr);
                     }
-                    true
                 }
                 Ok(Err(e)) => {
                     #[cfg(feature = "defmt")]
                     let e = defmt::Debug2Format(&e);
                     error!("Connect error: {:?}", e);
                     Timer::after_millis(500).await;
-                    false
                 }
                 Err(_) => {
                     // None answered.
-                    if crate::state::current_sleep_state() {
+                    if sleeping || crate::state::current_sleep_state() {
                         warn!("Connect timeout while asleep, keeping {} address(es)", pending.len());
                     } else {
                         warn!("Connect timeout, clearing {} address(es)", pending.len());
@@ -119,30 +135,18 @@ pub(crate) async fn scan_and_connect_peripherals<'a, C: Controller + ControllerC
                             peripheral_slots[id] = SlotState::NoAddr;
                         }
                     }
-                    false
                 }
-            };
-            // If connecting to the peripheral failed, and the central is sleeping,
-            // don't keep connecting, just wait.
-            if !connected {
-                wait_until_wakeup(ended).await;
             }
-        } else if peripheral_slots.iter().all(|s| matches!(s, SlotState::Connected(_))) {
-            // All peripherals are connected: wait until a session ends.
-            ended.ready_to_receive().await;
-        } else if crate::state::current_sleep_state() {
-            // There's empty peripheral slot, and the central is sleeping,
-            // don't scanning, just wait.
-            wait_until_wakeup(ended).await;
         } else {
             // Place the `NoAddr` peripherals by scanning for them.
             info!("Start scanning peripherals");
             let session = start_scan(stack, SPLIT_CENTRAL_SCAN_WINDOW, &[]).await;
-            let event = with_timeout(
-                Duration::from_secs(30),
-                select(PERIPHERAL_FOUND.wait(), ended.ready_to_receive()),
-            )
-            .await;
+            let scan_timeout = if sleeping {
+                SLEEP_RECONNECT_WINDOW
+            } else {
+                Duration::from_secs(30)
+            };
+            let event = with_timeout(scan_timeout, select(PERIPHERAL_FOUND.wait(), ended.ready_to_receive())).await;
             // Wait until the controller has confirmed the stop: it refuses an
             // initiator until then.
             session.stop().await;
@@ -159,22 +163,82 @@ pub(crate) async fn scan_and_connect_peripherals<'a, C: Controller + ControllerC
                         FLASH_CHANNEL
                             .send(FlashOperationMessage::PeerAddress(PeerAddress::new(id, true, addr)))
                             .await;
+                        retry_at = Instant::now();
+                        continue;
                     }
                     _ => {}
                 }
             }
         }
+        retry_at = Instant::now() + SLEEP_RECONNECT_PAUSE;
     }
 }
 
-async fn wait_until_wakeup(ended: &Channel<NoopRawMutex, usize, { crate::SPLIT_PERIPHERALS_NUM }>) {
+async fn wait_before_reconnect(
+    ended: &Channel<NoopRawMutex, usize, { crate::SPLIT_PERIPHERALS_NUM }>,
+    retry_at: Instant,
+) -> bool {
     while crate::state::current_sleep_state() {
+        // 半边掉线后无法传来唤醒按键，有主机连接时仍需定期重连。
+        if crate::state::active_transport().is_some() && Instant::now() >= retry_at {
+            break;
+        }
         if with_timeout(Duration::from_secs(1), ended.ready_to_receive())
             .await
             .is_ok()
         {
-            return;
+            return false;
         }
+    }
+    true
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use core::sync::atomic::Ordering;
+
+    use rmk_types::ble::BleState;
+
+    use super::*;
+    use crate::ble::sleep::SLEEPING_STATE;
+    use crate::state::set_ble_state;
+    use crate::test_support::test_block_on;
+
+    #[test]
+    fn sleeping_reconnect_waits_for_host_and_retry_deadline() {
+        test_block_on(async {
+            let ended = Channel::new();
+            SLEEPING_STATE.store(true, Ordering::Release);
+            set_ble_state(BleState::Advertising);
+            assert!(
+                with_timeout(Duration::from_secs(2), wait_before_reconnect(&ended, Instant::now()))
+                    .await
+                    .is_err()
+            );
+
+            set_ble_state(BleState::Connected);
+            let retry_at = Instant::now() + SLEEP_RECONNECT_PAUSE;
+            assert!(
+                with_timeout(Duration::from_secs(4), wait_before_reconnect(&ended, retry_at))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                with_timeout(Duration::from_secs(2), wait_before_reconnect(&ended, retry_at))
+                    .await
+                    .unwrap()
+            );
+
+            ended.try_send(0).unwrap();
+            let retry_at = Instant::now() + SLEEP_RECONNECT_PAUSE;
+            assert!(!wait_before_reconnect(&ended, retry_at).await);
+            assert_eq!(ended.try_receive(), Ok(0));
+
+            SLEEPING_STATE.store(false, Ordering::Release);
+            assert!(wait_before_reconnect(&ended, retry_at).await);
+            assert!(Instant::now() < retry_at);
+            set_ble_state(BleState::Inactive);
+        });
     }
 }
 

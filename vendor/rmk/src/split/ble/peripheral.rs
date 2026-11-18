@@ -204,7 +204,11 @@ pub async fn initialize_nrf_ble_split_peripheral_and_run<
                             central_addr = Some(new_addr);
                         }
                     }
-                    peripheral.run().await;
+                    if let Err(e) = peripheral.run().await {
+                        error!("Split peripheral session failed: {:?}", e);
+                    }
+                    // 发送失败也必须主动断开，让中央侧释放按键并允许重新连接。
+                    conn.raw().disconnect();
                     info!("Disconnected from the central");
                 }
                 Err(BleHostError::BleHost(Error::Timeout)) => {

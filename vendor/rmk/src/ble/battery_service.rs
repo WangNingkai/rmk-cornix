@@ -130,6 +130,30 @@ pub(crate) struct BleBatteryServer<'stack, 'server, 'conn, P: PacketPool> {
     >,
 }
 
+// 主机主动读取时只更新属性表，不发送通知或等待按键。
+pub(crate) fn refresh_battery_level(server: &Server, handle: u16) -> Result<(), Error> {
+    if handle == server.battery_service.level.handle {
+        if let BatteryStatus::Available { level: Some(level), .. } =
+            crate::input_device::battery::current_battery_status()
+        {
+            server.set(&server.battery_service.level, &level)?;
+        }
+        return Ok(());
+    }
+    #[cfg(feature = "split")]
+    for (slot, characteristic) in server.peripheral_battery_services.levels.iter().enumerate() {
+        if handle == characteristic.handle {
+            if let Some(BatteryStatus::Available { level: Some(level), .. }) =
+                crate::split::driver::current_peripheral_battery_status(crate::SPLIT_BATTERY_PERIPHERAL_IDS[slot])
+            {
+                server.set(characteristic, &level)?;
+            }
+            break;
+        }
+    }
+    Ok(())
+}
+
 impl<'stack, 'server, 'conn, P: PacketPool> BleBatteryServer<'stack, 'server, 'conn, P> {
     pub(crate) fn new(server: &Server, conn: &'conn GattConnection<'stack, 'server, P>) -> Self {
         Self {
@@ -207,6 +231,13 @@ fn find_peripheral_battery_slot(configured_ids: &[usize], peripheral_id: usize) 
 }
 
 #[cfg(feature = "split")]
+async fn peripheral_battery_after_key_press(peripheral_id: usize) -> Option<BatteryStatus> {
+    wait_for_key_press(&crate::keyboard::PERIPHERAL_KEY_PRESS_SIGNAL).await;
+    // 等待按键期间电量可能继续变化，通知必须使用此刻的缓存。
+    crate::split::driver::current_peripheral_battery_status(peripheral_id)
+}
+
+#[cfg(feature = "split")]
 fn initialize_peripheral_battery_levels(server: &Server) {
     for (slot, peripheral_id) in crate::SPLIT_BATTERY_PERIPHERAL_IDS.iter().copied().enumerate() {
         if let Some(BatteryStatus::Available { level: Some(level), .. }) =
@@ -260,9 +291,9 @@ impl<P: PacketPool> Runnable for BlePeripheralBatteryServer<'_, '_, '_, P> {
 
         loop {
             let event = self.sub.next_message_pure().await;
-            wait_for_key_press(&crate::keyboard::PERIPHERAL_KEY_PRESS_SIGNAL).await;
+            let state = peripheral_battery_after_key_press(event.id).await;
             if let Some(slot) = find_peripheral_battery_slot(&crate::SPLIT_BATTERY_PERIPHERAL_IDS, event.id)
-                && let BatteryStatus::Available { level: Some(level), .. } = event.state.0
+                && let Some(BatteryStatus::Available { level: Some(level), .. }) = state
                 && let Err(e) = self.battery_levels[slot].notify(self.conn, &level, true).await
             {
                 error!("Failed to notify peripheral {} battery level: {:?}", event.id, e);
@@ -423,6 +454,116 @@ mod tests {
 
 #[cfg(test)]
 mod notification_tests {
+    #[test]
+    fn central_read_refreshes_battery_without_a_key_press() {
+        use super::*;
+        use crate::input_device::battery::BATTERY_STATUS;
+        use rmk_types::battery::ChargeState;
+
+        let server = Server::new_default("test").unwrap();
+        let level = server.battery_service.level;
+        server.set(&level, &80).unwrap();
+        BATTERY_STATUS.lock(|status| {
+            status.set(BatteryStatus::Available {
+                level: Some(70),
+                charge_state: ChargeState::Discharging,
+            });
+        });
+
+        refresh_battery_level(&server, level.handle).unwrap();
+        assert_eq!(server.get(&level).unwrap(), 70);
+        assert!(!KEY_PRESS_SIGNAL.signaled());
+    }
+
+    #[cfg(feature = "split")]
+    #[test]
+    fn peripheral_read_refreshes_only_the_requested_battery() {
+        use super::*;
+        use crate::split::driver::set_peripheral_battery;
+        use rmk_types::battery::ChargeState;
+
+        let server = Server::new_default("test").unwrap();
+        let central = server.battery_service.level;
+        let peripheral = server.peripheral_battery_services.levels[0];
+        server.set(&central, &80).unwrap();
+        server.set(&peripheral, &60).unwrap();
+        set_peripheral_battery(
+            crate::SPLIT_BATTERY_PERIPHERAL_IDS[0],
+            BatteryStatus::Available {
+                level: Some(50),
+                charge_state: ChargeState::Discharging,
+            },
+        );
+
+        refresh_battery_level(&server, peripheral.handle).unwrap();
+        assert_eq!(server.get(&peripheral).unwrap(), 50);
+        assert_eq!(server.get(&central).unwrap(), 80);
+        assert!(!crate::keyboard::PERIPHERAL_KEY_PRESS_SIGNAL.signaled());
+    }
+
+    #[test]
+    fn unknown_battery_and_unrelated_reads_preserve_attribute_values() {
+        use super::*;
+        use crate::input_device::battery::BATTERY_STATUS;
+        use rmk_types::battery::ChargeState;
+
+        let server = Server::new_default("test").unwrap();
+        let level = server.battery_service.level;
+        server.set(&level, &80).unwrap();
+        for state in [
+            BatteryStatus::Unavailable,
+            BatteryStatus::Available {
+                level: None,
+                charge_state: ChargeState::Unknown,
+            },
+        ] {
+            BATTERY_STATUS.lock(|status| status.set(state));
+            refresh_battery_level(&server, level.handle).unwrap();
+            assert_eq!(server.get(&level).unwrap(), 80);
+        }
+        BATTERY_STATUS.lock(|status| {
+            status.set(BatteryStatus::Available {
+                level: Some(70),
+                charge_state: ChargeState::Discharging,
+            })
+        });
+        refresh_battery_level(&server, server.hid_service.protocol_mode.handle).unwrap();
+        assert_eq!(server.get(&server.hid_service.protocol_mode).unwrap(), 1);
+        assert_eq!(server.get(&level).unwrap(), 80);
+    }
+
+    #[cfg(feature = "split")]
+    #[test]
+    fn peripheral_notification_uses_latest_battery_after_new_press() {
+        use super::*;
+        use crate::keyboard::PERIPHERAL_KEY_PRESS_SIGNAL;
+        use crate::split::driver::set_peripheral_battery;
+        use rmk_types::battery::ChargeState;
+
+        crate::test_support::test_block_on(async {
+            let battery = |level| BatteryStatus::Available {
+                level: Some(level),
+                charge_state: ChargeState::Discharging,
+            };
+            let mut sub = PeripheralBatteryEvent::subscriber();
+            set_peripheral_battery(0, battery(80));
+            let event = sub.next_message_pure().await;
+            KEY_PRESS_SEQUENCE.store(7, Ordering::Release);
+            PERIPHERAL_KEY_PRESS_SIGNAL.signal(7);
+            let mut notification = core::pin::pin!(peripheral_battery_after_key_press(event.id));
+            assert!(futures::poll!(notification.as_mut()).is_pending());
+
+            // 等待期间多次更新电量，旧按键和电量变化都不能触发通知。
+            for level in [75, 70] {
+                set_peripheral_battery(0, battery(level));
+                assert!(futures::poll!(notification.as_mut()).is_pending());
+            }
+            KEY_PRESS_SEQUENCE.store(8, Ordering::Release);
+            PERIPHERAL_KEY_PRESS_SIGNAL.signal(8);
+            assert_eq!(notification.await, Some(battery(70)));
+        });
+    }
+
     #[test]
     fn stale_press_does_not_unblock_battery_notification() {
         use super::*;
