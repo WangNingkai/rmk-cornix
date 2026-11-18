@@ -1,6 +1,6 @@
 [package]
 name = "rmk-cornix"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["adong660 <adong660@gmail.com>"]
 description = "RMK firmware for Cornix"
 readme = "README.md"
