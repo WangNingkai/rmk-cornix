@@ -102,12 +102,39 @@ layers = 10
 [[keymap.layer]]
 name = "base_layer"
 keys = """
-ESC     Q     W     E     R      T                Y     U      I      O     P          BSPC
-TAB     A     S     D     F      G                H     J      K      L     SEMICOLON  QUOT
-LSHIFT  Z     X     C     V      B    NO    NO    N     M      COMMA  DOT   SLASH      RSHIFT
-LCTRL   LGUI  LALT  NO    SPACE  NO               NO    ENTER  NO     RALT  MENU       RCTRL
+Tab     Q     W     E      R      T                                  Y      U      I      O     P          Backspace
+CapsLock A    S     D      F      G                                  H      J      K      L     Semicolon  Enter
+LShift  Z     X     C      V      B       AudioMute  MediaPlayPause  N      M      Comma  Dot   Up         Slash
+LCtrl   LAlt  LGui  MO(1)  MO(3)  Space                              Space  MO(4)  MO(2)  Left  Down       Right
 """
-encoders = [["PgDn", "PgUp"], ["AudioVolUp", "AudioVolDown"]]
+encoders = [["AudioVolUp", "AudioVolDown"], ["MediaPrevTrack", "MediaNextTrack"]]
+
+[[keymap.layer]]
+name = "number_layer"
+keys = """
+Escape  Kc1  Kc2  Kc3  Kc4        Kc5          Kc6    Kc7  Kc8          Kc9           Kc0  Delete
+_       _    _    _    Semicolon  Minus        Equal  Quote _          _             _    _
+_       _    _    _    _          _     _   _  _      _     LeftBracket RightBracket _    _
+_       _    _    _    _          _            _      _     _          _             _    _
+"""
+
+[[keymap.layer]]
+name = "function_layer"
+keys = """
+F1     F2     F3  F4  F5  F6         F7  F8  F9  F10  F11  F12
+User0  _      _   _   _   _          _   _   _   _    _    _
+User1  _      _   _   _   _   _   _  _   _   _   _    _    _
+User2  User7  _   _   _   _          _   _   _   _    _    _
+"""
+
+[[keymap.layer]]
+name = "bluetooth_layer"
+keys = """
+_      _  _  _  _  _         _  _  _  _  _  _
+User0  _  _  _  _  _         _  _  _  _  _  _
+User1  _  _  _  _  _   _  _  _  _  _  _  _  _
+User2  _  _  _  _  _         _  _  _  _  _  _
+"""
 
 [behavior.one_shot]
 timeout = "3s"

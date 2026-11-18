@@ -88,13 +88,15 @@
 
 ### 本地构建
 
-需要 Rust `1.96.0`（组件和目标见 `rust-toolchain.toml`）、`flip-link`、`cargo-make`
+需要 Rust `stable`（组件和目标见 `rust-toolchain.toml`）、`flip-link`、`cargo-make`
 以及 UF2 转换工具。`Makefile.toml` 定义了构建任务和相关工具的安装依赖。
 
 还需要完整的 ARM GNU 裸机工具链（`arm-none-eabi-gcc`、`arm-none-eabi-ar` 及 newlib 头文件）。
 新版蓝牙加密依赖会编译 C／汇编，请将工具链的 `bin` 目录加入 `PATH`。
 
-在仓库根目录按需修改 [`keyboard.toml`](keyboard.toml)，然后生成刷机文件。
+[`keyboard.toml`](keyboard.toml) 的默认按键和旋钮来自 Vial 导出。固件预置四层键位，
+其余六层的按键继承下层。键盘会优先使用已保存的键位，存储初始化后才加载固件默认键位。
+按需修改配置后，在仓库根目录生成刷机文件。
 
 ```sh
 cargo make uf2

@@ -21,14 +21,14 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.96.0 \
+          rustup toolchain install stable \
             --profile minimal \
             --target thumbv7em-none-eabihf \
             --component rust-src \
             --component rustfmt \
             --component clippy \
             --component llvm-tools
-          rustup default 1.96.0
+          rustc --version
 
       - name: Install ARM C toolchain
         run: |

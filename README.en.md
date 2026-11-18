@@ -93,14 +93,16 @@ use the left and right UF2 files you saved from the same previous build.
 
 ### Build locally
 
-You need Rust `1.96.0`, `flip-link`, `cargo-make`, and the UF2 conversion tools. The Rust components and target are listed in
+You need Rust `stable`, `flip-link`, `cargo-make`, and the UF2 conversion tools. The Rust components and target are listed in
 [`rust-toolchain.toml`](rust-toolchain.toml). The build tasks and tool installation steps are defined in
 [`Makefile.toml`](Makefile.toml).
 
 You also need the ARM GNU bare-metal toolchain, including `arm-none-eabi-gcc`, `arm-none-eabi-ar`, and the newlib headers.
 Add the toolchain's `bin` directory to `PATH` so the Bluetooth cryptography dependency can compile its C and assembly code.
 
-From the repository root, edit [`keyboard.toml`](keyboard.toml) as needed and build the flashable files.
+The default keys and encoders in [`keyboard.toml`](keyboard.toml) come from a Vial export. Four layers have preset bindings,
+and keys on the other six layers fall through to lower layers. Saved bindings take priority until the firmware initializes
+storage. Edit the configuration as needed, then build the flashable files from the repository root.
 
 ```sh
 cargo make uf2
