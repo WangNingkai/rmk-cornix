@@ -51,7 +51,13 @@ jobs:
         run: python3 tests/test_memory_layout.py
 
       - name: Install nextest
-        run: cargo install cargo-nextest --locked --version 0.9.152
+        run: |
+          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" \
+            https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.152/cargo-nextest-0.9.152-x86_64-unknown-linux-musl.tar.gz
+          printf '521c5f790ed07ee69d0a88403d9d86a8c8ab27977f12fc73f22aa4e7e14a0f71  %s\n' "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "${CARGO_HOME:-$HOME/.cargo}/bin" cargo-nextest
+          cargo nextest --version
 
       - name: Run RMK library tests
         env:
@@ -64,7 +70,13 @@ jobs:
           --lib
 
       - name: Install cargo-make
-        run: cargo install cargo-make --locked --version 0.37.24
+        run: |
+          archive="$RUNNER_TEMP/cargo-make.zip"
+          asset=cargo-make-v0.37.24-x86_64-unknown-linux-gnu
+          curl -fsSL --retry 3 -o "$archive" "https://github.com/sagiegurari/cargo-make/releases/download/0.37.24/$asset.zip"
+          printf '92a663fe3eeae741c17788202937f2e2f3f7effa2669f733f4d6a1659954288b  %s\n' "$archive" | sha256sum -c -
+          unzip -jo "$archive" "$asset/cargo-make" -d "${CARGO_HOME:-$HOME/.cargo}/bin"
+          cargo make --version
 
       - name: Build UF2 artifacts
         run: cargo make uf2
