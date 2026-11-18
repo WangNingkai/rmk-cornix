@@ -12,8 +12,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      KEYBOARD_TOML_PATH: keyboard.toml
-      VIAL_JSON_PATH: vial.json
+      KEYBOARD_TOML_PATH: ${{ github.workspace }}/keyboard.toml
+      VIAL_JSON_PATH: ${{ github.workspace }}/vial.json
       # 让 Bindgen 使用 Cortex-M 的标准整数定义，避免转发到宿主头文件。
       BINDGEN_EXTRA_CLANG_ARGS_thumbv7em_none_eabihf: -ffreestanding
     steps:
