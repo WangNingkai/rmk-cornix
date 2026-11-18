@@ -39,7 +39,7 @@ For a test build, run **Build RMK firmware** manually in GitHub Actions and down
 
 ### Vial and the default keymap
 
-Connect the left half to your computer over USB, then open Vial.
+Pair and connect the left half to your computer over Bluetooth, then open Vial to remap keys. You can also use Vial with the left half connected over USB.
 
 See [`keyboard.toml`](keyboard.toml) for the default keymap and encoder bindings. On the base layer, the left encoder controls volume and the right encoder changes tracks. The number, function, and Bluetooth layers inherit these actions. `MO(4)` opens the custom layer, which inherits lower-layer actions by default. The firmware uses saved bindings when available and loads the defaults when it initializes storage.
 
@@ -120,7 +120,7 @@ KEYBOARD_TOML_PATH="$PWD/tests/rmk.toml" cargo nextest run \
 
 ### Hardware checks
 
-- [ ] Check Bluetooth pairing and wake-up on the target devices. Check wired input, Vial save and restore, both halves' keys, and both encoders.
+- [ ] Check Bluetooth pairing and wake-up, USB input, both halves' keys, and both encoders on the target devices. Check Vial save and restore over both Bluetooth and USB.
 - [ ] Flash two independent builds using the same storage format and verify that Vial key and encoder bindings and Bluetooth pairings persist.
 - [ ] Tap a Bluetooth profile key to switch profiles. Hold the profile key and release the layer key during the hold. Verify that pairing is available after five seconds.
 - [ ] Keep the left half connected to a host and let it sleep, then turn on the right half. Check that input resumes automatically, and record reconnection time and left-half power draw.
