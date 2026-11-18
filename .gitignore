@@ -11,3 +11,4 @@
 /vendor/**/Cargo.lock
 /vendor/**/Cargo.toml.orig
 rmk-cornix-firmware*
+**/.DS_Store/**
