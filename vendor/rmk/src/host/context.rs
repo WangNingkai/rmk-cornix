@@ -15,6 +15,8 @@ use rmk_types::protocol::rynk::BehaviorConfig;
 use crate::event::KeyboardEventPos;
 use crate::keyboard::combo::Combo;
 use crate::keymap::KeyMap;
+#[cfg(all(feature = "vial", feature = "storage"))]
+use crate::storage::{VialKeymapWrite, save_vial_keymap};
 #[cfg(feature = "storage")]
 use crate::{channel::FLASH_CHANNEL, storage::FlashOperationMessage};
 
@@ -51,10 +53,28 @@ impl<'a> KeyboardContext<'a> {
         self.layout_blob
     }
 
-    pub async fn set_action(&self, layer: u8, row: u8, col: u8, action: KeyAction) {
+    pub async fn set_action(&self, layer: u8, row: u8, col: u8, action: KeyAction) -> bool {
+        let (rows, cols, layers) = self.keymap_dimensions();
+        if layer as usize >= layers || row as usize >= rows || col as usize >= cols {
+            return false;
+        }
+        #[cfg(all(feature = "vial", feature = "storage"))]
+        match self.keymap.storage_ready {
+            Some(true) => {
+                return save_vial_keymap(VialKeymapWrite::Key {
+                    layer,
+                    row,
+                    col,
+                    action,
+                })
+                .await;
+            }
+            Some(false) => return false,
+            None => {}
+        }
         self.keymap
             .set_action_at(KeyboardEventPos::key_pos(col, row), layer as usize, action);
-        #[cfg(feature = "storage")]
+        #[cfg(all(feature = "rynk", feature = "storage"))]
         FLASH_CHANNEL
             .send(FlashOperationMessage::KeymapKey {
                 layer,
@@ -63,41 +83,7 @@ impl<'a> KeyboardContext<'a> {
                 action,
             })
             .await;
-    }
-
-    /// Synchronous on purpose: Vial's bulk-write path (`DynamicKeymapSetBuffer`)
-    /// calls this in a tight loop and would otherwise serialize against flash
-    /// for the whole packet. Drops the persist message on a full channel
-    /// rather than awaiting capacity, matching pre-context Vial behavior.
-    ///
-    /// `rows` / `cols` are passed in so callers can hoist the dimensions read
-    /// out of their loop — see `keymap_dimensions()`.
-    pub fn try_set_action_flat(&self, index: usize, action: KeyAction, rows: usize, cols: usize) {
-        self.keymap.set_action_by_flat_index(index, action);
-        #[cfg(feature = "storage")]
-        {
-            let layer_size = rows * cols;
-            let layer = index / layer_size;
-            let layer_offset = index % layer_size;
-            let row = layer_offset / cols;
-            let col = layer_offset % cols;
-            if FLASH_CHANNEL
-                .try_send(FlashOperationMessage::KeymapKey {
-                    layer: layer as u8,
-                    row: row as u8,
-                    col: col as u8,
-                    action,
-                })
-                .is_err()
-            {
-                error!(
-                    "Failed to persist keymap key at layer {} ({},{}): flash channel full",
-                    layer, row, col
-                );
-            }
-        }
-        #[cfg(not(feature = "storage"))]
-        let _ = (rows, cols);
+        true
     }
 
     pub fn get_encoder(&self, layer: u8, idx: u8) -> Option<EncoderAction> {
@@ -110,29 +96,30 @@ impl<'a> KeyboardContext<'a> {
     }
 
     /// Write one encoder direction and persist the updated pair.
-    pub async fn set_encoder_direction(&self, layer: u8, idx: u8, clockwise: bool, action: KeyAction) {
-        let updated = if clockwise {
-            self.keymap.set_encoder_clockwise(layer as usize, idx as usize, action)
-        } else {
-            self.keymap
-                .set_encoder_counter_clockwise(layer as usize, idx as usize, action)
-        };
+    #[cfg(feature = "vial")]
+    pub async fn set_encoder_direction(&self, layer: u8, idx: u8, clockwise: bool, action: KeyAction) -> bool {
         #[cfg(feature = "storage")]
-        if let Some(encoder) = updated {
-            FLASH_CHANNEL
-                .send(FlashOperationMessage::Encoder {
-                    idx,
+        match self.keymap.storage_ready {
+            Some(true) => {
+                return save_vial_keymap(VialKeymapWrite::Encoder {
                     layer,
-                    action: encoder,
+                    idx,
+                    clockwise,
+                    action,
                 })
                 .await;
+            }
+            Some(false) => return false,
+            None => {}
         }
-        #[cfg(not(feature = "storage"))]
-        let _ = updated;
+        self.keymap
+            .encoder_with_direction(layer as usize, idx as usize, clockwise, action)
+            .is_some_and(|encoder| self.keymap.set_encoder(layer as usize, idx as usize, encoder))
     }
 
     /// Write both encoder directions in one synchronous RAM update, then persist
     /// once.
+    #[cfg(feature = "rynk")]
     pub async fn set_encoder(&self, layer: u8, idx: u8, action: EncoderAction) {
         let written = self.keymap.set_encoder(layer as usize, idx as usize, action);
         #[cfg(feature = "storage")]

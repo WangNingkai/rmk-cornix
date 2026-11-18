@@ -1,4 +1,4 @@
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use byteorder::{BigEndian, ByteOrder};
 use embassy_time::Instant;
 use embedded_io_async::{Read, Write};
 use rmk_types::protocol::vial::{VIA_FIRMWARE_VERSION, VIA_PROTOCOL_VERSION, ViaCommand, ViaKeyboardInfo};
@@ -38,11 +38,18 @@ impl<'a> VialService<'a> {
     }
 
     async fn process_via_packet(&self, report: &mut ViaReport) {
-        let command_id = report.output_data[0];
+        let command = report.output_data[0].into();
+        #[cfg(feature = "storage")]
+        if self.ctx.keymap.storage_ready == Some(false)
+            && !matches!(command, ViaCommand::EepromReset | ViaCommand::BootloaderJump)
+        {
+            report.input_data[0] = ViaCommand::Unhandled as u8;
+            return;
+        }
 
         // Caller pre-fills `input_data` from `output_data`, so individual arms
         // only need to overwrite the bytes they actually change.
-        match command_id.into() {
+        match command {
             ViaCommand::GetProtocolVersion => {
                 BigEndian::write_u16(&mut report.input_data[1..3], VIA_PROTOCOL_VERSION);
             }
@@ -120,7 +127,9 @@ impl<'a> VialService<'a> {
                     "Setting keycode: 0x{:02X} at ({},{}), layer {} as {:?}",
                     keycode, row, col, layer, action
                 );
-                self.ctx.set_action(layer, row, col, action).await;
+                if !self.ctx.set_action(layer, row, col, action).await {
+                    report.input_data[0] = ViaCommand::Unhandled as u8;
+                }
             }
             ViaCommand::DynamicKeymapReset => {
                 warn!("Dynamic keymap reset -- not supported")
@@ -194,34 +203,36 @@ impl<'a> VialService<'a> {
             ViaCommand::DynamicKeymapGetLayerCount => {
                 report.input_data[1] = self.ctx.keymap_dimensions().2 as u8;
             }
-            ViaCommand::DynamicKeymapGetBuffer => {
-                let offset = BigEndian::read_u16(&report.output_data[1..3]);
-                // size <= 28
-                let size = report.output_data[3];
-                debug!("Getting keymap buffer, offset: {}, size: {}", offset, size);
-                let mut idx = 4;
-                let start = (offset / 2) as usize;
-                let count = (size / 2) as usize;
-                for i in 0..count {
-                    let a = self.ctx.get_action_flat(start + i);
-                    let kc = to_via_keycode(a);
-                    BigEndian::write_u16(&mut report.input_data[idx..idx + 2], kc);
-                    idx += 2;
+            ViaCommand::DynamicKeymapGetBuffer | ViaCommand::DynamicKeymapSetBuffer => {
+                let offset = BigEndian::read_u16(&report.output_data[1..3]) as usize;
+                let size = report.output_data[3] as usize;
+                let (rows, cols, layers) = self.ctx.keymap_dimensions();
+                let start = offset / 2;
+                if size > report.output_data.len() - 4
+                    || !offset.is_multiple_of(2)
+                    || !size.is_multiple_of(2)
+                    || start + size / 2 > rows * cols * layers
+                {
+                    report.input_data[0] = ViaCommand::Unhandled as u8;
+                    return;
                 }
-            }
-            ViaCommand::DynamicKeymapSetBuffer => {
-                debug!("Dynamic keymap set buffer");
-                let offset = BigEndian::read_u16(&report.output_data[1..3]);
-                // size <= 28
-                let size = report.output_data[3];
-                let mut idx = 4;
-                let (rows, cols, _) = self.ctx.keymap_dimensions();
-                for i in 0..(size as usize) {
-                    let via_keycode = LittleEndian::read_u16(&report.output_data[idx..idx + 2]);
-                    let action = from_via_keycode(via_keycode);
-                    let flat_index = offset as usize + i;
-                    self.ctx.try_set_action_flat(flat_index, action, rows, cols);
-                    idx += 2;
+
+                if matches!(command, ViaCommand::DynamicKeymapGetBuffer) {
+                    for (i, bytes) in report.input_data[4..4 + size].chunks_exact_mut(2).enumerate() {
+                        BigEndian::write_u16(bytes, to_via_keycode(self.ctx.get_action_flat(start + i)));
+                    }
+                } else {
+                    for (i, bytes) in report.output_data[4..4 + size].chunks_exact(2).enumerate() {
+                        let index = start + i;
+                        let layer = (index / (rows * cols)) as u8;
+                        let row = (index / cols % rows) as u8;
+                        let col = (index % cols) as u8;
+                        let action = from_via_keycode(BigEndian::read_u16(bytes));
+                        if !self.ctx.set_action(layer, row, col, action).await {
+                            report.input_data[0] = ViaCommand::Unhandled as u8;
+                            return;
+                        }
+                    }
                 }
             }
             ViaCommand::DynamicKeymapGetEncoder => {
@@ -325,6 +336,45 @@ mod tests {
         });
     }
 
+    #[test]
+    fn keymap_buffer_roundtrip_with_full_payload() {
+        let mut data = KeymapData::new([[[KeyAction::No; 16]]]);
+        let mut behavior = BehaviorConfig::default();
+        let positional = PositionalConfig::default();
+        let keymap = block_on(KeyMap::new(&mut data, &mut behavior, &positional));
+        let service = VialService::new(&keymap, &RmkConfig::default());
+        let mut bytes = [0; 32];
+        bytes[0] = ViaCommand::DynamicKeymapSetBuffer as u8;
+        BigEndian::write_u16(&mut bytes[1..3], 2);
+        bytes[3] = 28;
+        for (i, code) in bytes[4..].chunks_exact_mut(2).enumerate() {
+            BigEndian::write_u16(code, 4 + i as u16);
+        }
+        let mut report = ViaReport {
+            input_data: bytes,
+            output_data: bytes,
+        };
+        block_on(service.process_via_packet(&mut report));
+        assert_eq!(report.input_data[0], ViaCommand::DynamicKeymapSetBuffer as u8);
+        assert_eq!(keymap.action_at_pos(0, 0, 0), KeyAction::No);
+        assert_eq!(keymap.action_at_pos(0, 0, 15), KeyAction::No);
+
+        report.output_data[0] = ViaCommand::DynamicKeymapGetBuffer as u8;
+        report.input_data[4..].fill(0);
+        block_on(service.process_via_packet(&mut report));
+        assert_eq!(report.input_data[4..], bytes[4..]);
+
+        bytes[2] = 30;
+        bytes[3] = 4;
+        let mut report = ViaReport {
+            input_data: bytes,
+            output_data: bytes,
+        };
+        block_on(service.process_via_packet(&mut report));
+        assert_eq!(report.input_data[0], ViaCommand::Unhandled as u8);
+        assert_eq!(keymap.action_at_pos(0, 0, 15), KeyAction::No);
+    }
+
     /// A `GetKeyboardValue(LayoutOptions)` (0x02 0x02) or
     /// `SetKeyboardValue(LayoutOptions)` (0x03 0x02) report carrying `value`
     /// as the big-endian payload.
@@ -337,6 +387,23 @@ mod tests {
             input_data: output_data,
             output_data,
         }
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn layout_write_is_rejected_when_storage_is_unavailable() {
+        let mut data = KeymapData::new([[[KeyAction::No]]]);
+        let mut behavior = BehaviorConfig::default();
+        let positional = PositionalConfig::default();
+        let mut keymap = block_on(KeyMap::new(&mut data, &mut behavior, &positional));
+        keymap.storage_ready = Some(false);
+        let service = VialService::new(&keymap, &RmkConfig::default());
+
+        let mut report = layout_options_report(ViaCommand::SetKeyboardValue as u8, 42);
+        block_on(service.process_via_packet(&mut report));
+
+        assert_eq!(report.input_data[0], ViaCommand::Unhandled as u8);
+        assert_eq!(keymap.layout_option(), 0);
     }
 
     // GetKeyboardValue(LayoutOptions) must return the value written by

@@ -193,6 +193,37 @@ fn morse_write_changes_the_tap() {
 
 #[cfg(feature = "storage")]
 #[test]
+fn acknowledged_key_and_encoder_writes_survive_restart() {
+    test_block_on(async {
+        let flash = crate::simulator::flash::InMemoryFlash::new();
+        let builder = || SimKeyboard::builder([[[k!(A)]]]).encoders([[EncoderAction::new(k!(A), k!(B))]]);
+        {
+            let mut keyboard = builder().build_with_flash(flash.clone()).await;
+            let mut key = via(ViaCommand::DynamicKeymapSetKeyCode);
+            key[4..6].copy_from_slice(&to_via_keycode(k!(B)).to_be_bytes());
+            keyboard.echo(key);
+            let mut encoder = vial(VialCommand::SetEncoder);
+            encoder[4] = 1;
+            encoder[5..7].copy_from_slice(&to_via_keycode(k!(C)).to_be_bytes());
+            keyboard.echo(encoder);
+            keyboard.run().await;
+        }
+
+        let mut keyboard = builder().build_with_flash(flash).await;
+        keyboard
+            .tap(0, 0, 10)
+            .expect_keys([HidKeyCode::B])
+            .expect_keys([])
+            .rotary_cw(0)
+            .expect_keys([HidKeyCode::C])
+            .expect_keys([])
+            .run()
+            .await;
+    });
+}
+
+#[cfg(feature = "storage")]
+#[test]
 fn behavior_write_survives_restart() {
     test_block_on(async {
         let flash = crate::simulator::flash::InMemoryFlash::new();

@@ -79,16 +79,22 @@ pub(crate) fn rmk_entry_select(
     let devices_task = {
         let mut devs = devices.clone();
         devs.push(quote! {matrix});
-        if hardware.storage.is_some() {
+        let vial_storage = hardware.storage.is_some() && host.vial_enabled;
+        if hardware.storage.is_some() && !vial_storage {
             devs.push(quote! {storage});
         }
         if auto_mouse_layer_enabled {
             devs.push(quote! {auto_mouse_layer});
         }
-        quote! {
+        let device_runs = quote! {
             ::rmk::run_all! (
                 #(#devs),*
             )
+        };
+        if vial_storage {
+            quote! { ::rmk::join_all!(#device_runs, storage.run_with_vial_keymap(&keymap)) }
+        } else {
+            device_runs
         }
     };
     let processors_task = if processors.is_empty() {

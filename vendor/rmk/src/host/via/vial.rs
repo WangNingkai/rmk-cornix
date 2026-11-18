@@ -2,7 +2,9 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rmk_types::action::KeyAction;
 use rmk_types::constants::{COMBO_MAX_LENGTH, COMBO_MAX_NUM, MORSE_MAX_NUM};
 use rmk_types::morse::{DOUBLE_TAP, HOLD, HOLD_AFTER_TAP, Morse, MorseMode, TAP};
-use rmk_types::protocol::vial::{SettingKey, VIAL_EP_SIZE, VIAL_PROTOCOL_VERSION, VialCommand, VialDynamic};
+use rmk_types::protocol::vial::{
+    SettingKey, VIAL_EP_SIZE, VIAL_PROTOCOL_VERSION, ViaCommand, VialCommand, VialDynamic,
+};
 
 use crate::config::VialConfig;
 use crate::hid::ViaReport;
@@ -418,7 +420,9 @@ pub(crate) async fn process_vial<'a>(
             let keycode = BigEndian::read_u16(&report.output_data[5..7]);
             let action = from_via_keycode(keycode);
             info!("Setting encoder action (clockwise: {}): {:?}", clockwise, action);
-            ctx.set_encoder_direction(layer, index, clockwise == 1, action).await;
+            if clockwise > 1 || !ctx.set_encoder_direction(layer, index, clockwise == 1, action).await {
+                report.input_data[0] = ViaCommand::Unhandled as u8;
+            }
         }
         _ => (),
     }

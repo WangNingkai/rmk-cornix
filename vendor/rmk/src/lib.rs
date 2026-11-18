@@ -46,8 +46,6 @@ compile_error!(
 // Re-export self as ::rmk for macro-generated code to work both inside and outside the crate
 extern crate self as rmk;
 
-include!(concat!(env!("OUT_DIR"), "/constants.rs"));
-
 // TODO: re-export to `constants`?
 pub(crate) use rmk_types::constants::*;
 

@@ -1,6 +1,8 @@
 use core::fmt::Debug;
 
 use embassy_embedded_hal::adapter::BlockingAsync;
+#[cfg(feature = "vial")]
+use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::Duration;
 use embedded_storage::nor_flash::NorFlash;
@@ -23,14 +25,56 @@ use {
 use crate::ble::profile::ProfileInfo;
 use crate::boot::reboot_keyboard;
 use crate::channel::FLASH_CHANNEL;
+use crate::config;
 use crate::config::StorageConfig;
 #[cfg(all(feature = "_ble", feature = "split"))]
 use crate::split::ble::PeerAddress;
-use crate::{BUILD_HASH, config};
+
+// 首字节区分旧版布尔标记，格式不兼容时提高第二字节的版本号。
+const STORAGE_FORMAT: [u8; 2] = [b'C', 1];
 
 /// Signal to synchronize the flash operation status, usually used outside of the flash task.
 /// True if the flash operation is finished correctly, false if the flash operation is finished with error.
 pub(crate) static FLASH_OPERATION_FINISHED: Signal<crate::RawMutex, bool> = Signal::new();
+
+#[cfg(feature = "vial")]
+static VIAL_WRITE_SEQUENCE: Mutex<crate::RawMutex, u32> = Mutex::new(0);
+#[cfg(feature = "vial")]
+static VIAL_WRITE_RESULT: Signal<crate::RawMutex, (u32, bool)> = Signal::new();
+
+#[cfg(feature = "vial")]
+pub(crate) async fn save_vial_keymap(write: VialKeymapWrite) -> bool {
+    // USB 与蓝牙共用一个写入回执。会话取消后，下一条请求跳过旧回执。
+    let mut sequence = VIAL_WRITE_SEQUENCE.lock().await;
+    *sequence = sequence.wrapping_add(1);
+    FLASH_CHANNEL
+        .send(FlashOperationMessage::VialKeymap { id: *sequence, write })
+        .await;
+    loop {
+        let (id, saved) = VIAL_WRITE_RESULT.wait().await;
+        if id == *sequence {
+            return saved;
+        }
+    }
+}
+
+#[cfg(feature = "vial")]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub(crate) enum VialKeymapWrite {
+    Key {
+        layer: u8,
+        row: u8,
+        col: u8,
+        action: KeyAction,
+    },
+    Encoder {
+        layer: u8,
+        idx: u8,
+        clockwise: bool,
+        action: KeyAction,
+    },
+}
 
 // Request/response over `FLASH_CHANNEL`. One `Signal` per read variant; the
 // storage task fires the matching one once it has the result.
@@ -110,18 +154,23 @@ pub(crate) enum FlashOperationMessage {
     DefaultLayer(u8),
     #[cfg(feature = "host")]
     MacroData([u8; MACRO_SPACE_SIZE]),
-    #[cfg(feature = "host")]
+    #[cfg(feature = "rynk")]
     KeymapKey {
         layer: u8,
         row: u8,
         col: u8,
         action: KeyAction,
     },
-    #[cfg(feature = "host")]
+    #[cfg(feature = "rynk")]
     Encoder {
         layer: u8,
         idx: u8,
         action: EncoderAction,
+    },
+    #[cfg(feature = "vial")]
+    VialKeymap {
+        id: u32,
+        write: VialKeymapWrite,
     },
     #[cfg(feature = "host")]
     Combo {
@@ -173,7 +222,7 @@ pub(crate) enum FlashOperationMessage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(crate) enum StorageKey {
-    StorageConfig,
+    FormatVersion,
     LayoutConfig,
     BehaviorConfig,
     ConnectionType,
@@ -261,7 +310,7 @@ impl Key for StorageKey {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum StorageData {
-    StorageConfig(LocalStorageConfig),
+    FormatVersion([u8; 2]),
     LayoutConfig(LayoutConfig),
     BehaviorConfig(BehaviorConfig),
     ConnectionType(ConnectionType),
@@ -289,13 +338,6 @@ impl<'a> PostcardValue<'a> for StorageData {}
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, MaxSize)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub(crate) struct LocalStorageConfig {
-    enable: bool,
-    build_hash: u32,
-}
-
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, MaxSize)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(crate) struct LayoutConfig {
     pub(crate) default_layer: u8,
     pub(crate) layout_option: u32,
@@ -318,12 +360,6 @@ pub(crate) struct BehaviorConfig {
     // Interval for tapping capslock.
     // macOS has special processing of capslock, when tapping capslock, the tap interval should be another value
     pub(crate) tap_capslock_interval: u16,
-}
-
-impl From<LocalStorageConfig> for StorageData {
-    fn from(config: LocalStorageConfig) -> Self {
-        Self::StorageConfig(config)
-    }
 }
 
 impl From<LayoutConfig> for StorageData {
@@ -381,6 +417,7 @@ pub struct Storage<
 > {
     pub(crate) flash: MapStorage<StorageKey, F, StorageCache>,
     pub(crate) buffer: [u8; get_buffer_size()],
+    pub(crate) ready: bool,
 }
 
 /// Read out storage config, update and then save back.
@@ -401,6 +438,9 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
     Storage<F, ROW, COL, NUM_LAYER, NUM_ENCODER>
 {
     async fn fetch_data(&mut self, key: StorageKey) -> Option<StorageData> {
+        if !self.ready {
+            return None;
+        }
         match self.flash.fetch_item(&mut self.buffer, &key).await {
             Ok(data) => data,
             Err(e) => {
@@ -464,47 +504,33 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
         let mut storage = Self {
             flash: MapStorage::new(flash, MapConfig::new(storage_range), Cache::new_uncached()),
             buffer: [0; get_buffer_size()],
+            ready: false,
         };
+        #[cfg(feature = "host")]
+        let encoder_map = encoder_map.as_deref();
 
-        // Check whether keymap and configs have been storaged in flash
-        if !storage.check_enable().await || storage_config.clear_storage {
-            // Clear storage first
-            debug!("Clearing storage!");
-            let _ = storage.flash.erase_all().await;
-
-            // Initialize storage from keymap and config
-            if storage
-                .initialize_storage_with_config(
+        // 自动修复可能遇到一次性 Flash 错误，重试前保留现有数据。
+        for _ in 0..2 {
+            match storage
+                .prepare(
                     #[cfg(feature = "host")]
                     keymap,
                     #[cfg(feature = "host")]
                     encoder_map,
+                    storage_config,
                     behavior_config,
                 )
                 .await
-                .is_err()
             {
-                // When there's an error, `enable: false` should be saved back to storage, preventing partial initialization of storage
-                storage
-                    .store_data(
-                        StorageKey::StorageConfig,
-                        &StorageData::from(LocalStorageConfig {
-                            enable: false,
-                            build_hash: BUILD_HASH,
-                        }),
-                    )
-                    .await
-                    .ok();
-            }
-        } else if storage_config.clear_layout {
-            #[cfg(feature = "host")]
-            {
-                debug!("clear_layout=true; overwriting layout items without erase.");
-                let encoder_map = encoder_map.as_ref().map(|m| &**m);
-                let _ = storage.reset_layout_only(keymap, &encoder_map, behavior_config).await;
+                Ok(()) => {
+                    storage.ready = true;
+                    return storage;
+                }
+                Err(error) => print_storage_error::<F>(error),
             }
         }
 
+        error!("Flash preparation failed, storage unavailable for this boot");
         storage
     }
 
@@ -531,76 +557,49 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
         Ok(())
     }
 
-    async fn initialize_storage_with_config(
+    async fn prepare(
         &mut self,
         #[cfg(feature = "host")] keymap: &[[[KeyAction; COL]; ROW]; NUM_LAYER],
-        #[cfg(feature = "host")] encoder_map: &Option<&mut [[EncoderAction; NUM_ENCODER]; NUM_LAYER]>,
+        #[cfg(feature = "host")] encoder_map: Option<&[[EncoderAction; NUM_ENCODER]; NUM_LAYER]>,
+        storage_config: &StorageConfig,
         behavior: &config::BehaviorConfig,
-    ) -> Result<(), ()> {
-        // Save storage config
-        self.store_data(
-            StorageKey::StorageConfig,
-            &StorageData::from(LocalStorageConfig {
-                enable: true,
-                build_hash: BUILD_HASH,
-            }),
-        )
-        .await
-        .map_err(|e| print_storage_error::<F>(e))?;
+    ) -> Result<(), SSError<F::Error>> {
+        if !storage_config.clear_storage
+            && matches!(
+                self.flash
+                    .fetch_item(&mut self.buffer, &StorageKey::FormatVersion)
+                    .await?,
+                Some(StorageData::FormatVersion(STORAGE_FORMAT))
+            )
+        {
+            #[cfg(feature = "host")]
+            if storage_config.clear_layout {
+                debug!("clear_layout=true; overwriting layout items without erase.");
+                self.write_default_settings(keymap, encoder_map, behavior).await?;
+            }
+            return Ok(());
+        }
 
-        // Save layout config
-        self.store_data(
-            StorageKey::LayoutConfig,
-            &StorageData::from(LayoutConfig {
-                default_layer: 0,
-                layout_option: 0,
-            }),
+        debug!("Clearing storage!");
+        self.flash.erase_all().await?;
+        self.write_default_settings(
+            #[cfg(feature = "host")]
+            keymap,
+            #[cfg(feature = "host")]
+            encoder_map,
+            behavior,
         )
-        .await
-        .map_err(|e| print_storage_error::<F>(e))?;
+        .await?;
 
-        // Save behavior config
-        self.store_data(StorageKey::BehaviorConfig, &StorageData::from(behavior))
+        // 写完所有默认设置后再提交标记，中途断电时下次启动会重试。
+        self.store_data(StorageKey::FormatVersion, &StorageData::FormatVersion(STORAGE_FORMAT))
             .await
-            .map_err(|e| print_storage_error::<F>(e))?;
-
-        #[cfg(feature = "host")]
-        for (layer, layer_data) in keymap.iter().enumerate() {
-            for (row, row_data) in layer_data.iter().enumerate() {
-                for (col, action) in row_data.iter().enumerate() {
-                    self.store_data(
-                        StorageKey::keymap(layer as u8, row as u8, col as u8),
-                        &StorageData::KeyAction(*action),
-                    )
-                    .await
-                    .map_err(|e| print_storage_error::<F>(e))?;
-                }
-            }
-        }
-
-        // Save encoder configurations
-        #[cfg(feature = "host")]
-        if let Some(encoder_map) = encoder_map {
-            for (layer, layer_data) in encoder_map.iter().enumerate() {
-                for (idx, action) in layer_data.iter().enumerate() {
-                    self.store_data(
-                        StorageKey::encoder(idx as u8, layer as u8),
-                        &StorageData::EncoderAction(*action),
-                    )
-                    .await
-                    .map_err(|e| print_storage_error::<F>(e))?;
-                }
-            }
-        }
-
-        Ok(())
     }
 
-    #[cfg(feature = "host")]
-    async fn reset_layout_only(
+    async fn write_default_settings(
         &mut self,
-        keymap: &[[[KeyAction; COL]; ROW]; NUM_LAYER],
-        encoder_map: &Option<&[[EncoderAction; NUM_ENCODER]; NUM_LAYER]>,
+        #[cfg(feature = "host")] keymap: &[[[KeyAction; COL]; ROW]; NUM_LAYER],
+        #[cfg(feature = "host")] encoder_map: Option<&[[EncoderAction; NUM_ENCODER]; NUM_LAYER]>,
         behavior: &config::BehaviorConfig,
     ) -> Result<(), SSError<F::Error>> {
         self.store_data(
@@ -611,10 +610,11 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
             }),
         )
         .await?;
+
         self.store_data(StorageKey::BehaviorConfig, &StorageData::from(behavior))
             .await?;
 
-        // TODO: Generic reset for vial and other hosts
+        #[cfg(feature = "host")]
         for (layer, layer_data) in keymap.iter().enumerate() {
             for (row, row_data) in layer_data.iter().enumerate() {
                 for (col, action) in row_data.iter().enumerate() {
@@ -627,7 +627,7 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
             }
         }
 
-        // TODO: Generic reset for vial and other hosts
+        #[cfg(feature = "host")]
         if let Some(encoder_map) = encoder_map {
             for (layer, layer_data) in encoder_map.iter().enumerate() {
                 for (idx, action) in layer_data.iter().enumerate() {
@@ -643,21 +643,52 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
         Ok(())
     }
 
-    async fn check_enable(&mut self) -> bool {
-        if let Some(StorageData::StorageConfig(config)) = self.fetch_data(StorageKey::StorageConfig).await
-            && config.enable
-            && config.build_hash == BUILD_HASH
-        {
-            return true;
-        }
-        false
+    #[cfg(feature = "vial")]
+    #[doc(hidden)]
+    pub async fn run_with_vial_keymap(&mut self, keymap: &crate::keymap::KeyMap<'_>) -> ! {
+        self.run_storage(Some(keymap)).await
     }
-}
 
-impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_ENCODER: usize>
-    crate::core_traits::Runnable for Storage<F, ROW, COL, NUM_LAYER, NUM_ENCODER>
-{
-    async fn run(&mut self) -> ! {
+    #[cfg(feature = "vial")]
+    async fn write_vial_keymap(
+        &mut self,
+        keymap: &crate::keymap::KeyMap<'_>,
+        write: VialKeymapWrite,
+    ) -> Result<bool, SSError<F::Error>> {
+        match write {
+            VialKeymapWrite::Key {
+                layer,
+                row,
+                col,
+                action,
+            } => {
+                self.store_data(StorageKey::keymap(layer, row, col), &StorageData::KeyAction(action))
+                    .await?;
+                keymap.set_action_at(
+                    crate::event::KeyboardEventPos::key_pos(col, row),
+                    layer as usize,
+                    action,
+                );
+            }
+            VialKeymapWrite::Encoder {
+                layer,
+                idx,
+                clockwise,
+                action,
+            } => {
+                let Some(encoder) = keymap.encoder_with_direction(layer as usize, idx as usize, clockwise, action)
+                else {
+                    return Ok(false);
+                };
+                self.store_data(StorageKey::encoder(idx, layer), &StorageData::EncoderAction(encoder))
+                    .await?;
+                keymap.set_encoder(layer as usize, idx as usize, encoder);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn run_storage(&mut self, #[cfg(feature = "vial")] keymap: Option<&crate::keymap::KeyMap<'_>>) -> ! {
         loop {
             let info: FlashOperationMessage = FLASH_CHANNEL.receive().await;
             debug!("Flash operation: {:?}", info);
@@ -700,13 +731,32 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
                     continue;
                 }
 
-                FlashOperationMessage::LayoutOptions(layout_option) => {
-                    update_storage_field!(&mut self.flash, &mut self.buffer, LayoutConfig, layout_option)
-                }
                 FlashOperationMessage::Reset => {
                     let result = self.flash.erase_all().await;
-                    reboot_keyboard();
+                    if result.is_ok() {
+                        reboot_keyboard();
+                    }
                     result
+                }
+                #[cfg(feature = "vial")]
+                FlashOperationMessage::VialKeymap { id, write } => {
+                    let saved = if let Some(keymap) = keymap.filter(|_| self.ready) {
+                        self.write_vial_keymap(keymap, write)
+                            .await
+                            .map_err(print_storage_error::<F>)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    VIAL_WRITE_RESULT.signal((id, saved));
+                    continue;
+                }
+                _ if !self.ready => {
+                    FLASH_OPERATION_FINISHED.signal(false);
+                    continue;
+                }
+                FlashOperationMessage::LayoutOptions(layout_option) => {
+                    update_storage_field!(&mut self.flash, &mut self.buffer, LayoutConfig, layout_option)
                 }
                 FlashOperationMessage::ResetLayout => {
                     info!("Ignoring ResetLayout at runtime (handled at startup via clear_layout).");
@@ -720,7 +770,7 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
                     self.store_data(StorageKey::MacroData, &StorageData::MacroData(data))
                         .await
                 }
-                #[cfg(feature = "host")]
+                #[cfg(feature = "rynk")]
                 FlashOperationMessage::KeymapKey {
                     layer,
                     row,
@@ -730,7 +780,7 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
                     self.store_data(StorageKey::keymap(layer, row, col), &StorageData::KeyAction(action))
                         .await
                 }
-                #[cfg(feature = "host")]
+                #[cfg(feature = "rynk")]
                 FlashOperationMessage::Encoder { layer, idx, action } => {
                     self.store_data(StorageKey::encoder(idx, layer), &StorageData::EncoderAction(action))
                         .await
@@ -832,6 +882,18 @@ impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usiz
     }
 }
 
+impl<F: AsyncNorFlash, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_ENCODER: usize>
+    crate::core_traits::Runnable for Storage<F, ROW, COL, NUM_LAYER, NUM_ENCODER>
+{
+    async fn run(&mut self) -> ! {
+        self.run_storage(
+            #[cfg(feature = "vial")]
+            None,
+        )
+        .await
+    }
+}
+
 pub(crate) fn print_storage_error<F: AsyncNorFlash>(e: SSError<F::Error>) {
     match e {
         #[cfg(feature = "defmt")]
@@ -877,6 +939,81 @@ mod tests {
     use crate::config::{BehaviorConfig as RuntimeBehaviorConfig, StorageConfig as RuntimeStorageConfig};
     use crate::test_support::test_block_on as block_on;
 
+    #[cfg(feature = "vial")]
+    #[test]
+    fn vial_writes_finish_in_storage_even_if_host_disconnects() {
+        use crate::config::PositionalConfig;
+        use crate::keymap::KeymapData;
+        use embassy_futures::select::{Either, select};
+
+        block_on(async {
+            let mut data =
+                KeymapData::new_with_encoder([[[KeyAction::No]]], [[crate::encoder!(KeyAction::No, KeyAction::No)]]);
+            let mut behavior = RuntimeBehaviorConfig::default();
+            let positional = PositionalConfig::default();
+            let (keymap, mut storage) = crate::initialize_keymap_and_storage(
+                &mut data,
+                TestFlash::<16_384, 4_096, 4>::new(),
+                &RuntimeStorageConfig::default(),
+                &mut behavior,
+                &positional,
+            )
+            .await;
+
+            let first = VialKeymapWrite::Key {
+                layer: 0,
+                row: 0,
+                col: 0,
+                action: KeyAction::Transparent,
+            };
+            assert!(matches!(
+                select(save_vial_keymap(first), core::future::ready(())).await,
+                Either::Second(())
+            ));
+            assert_eq!(keymap.action_at_pos(0, 0, 0), KeyAction::No);
+
+            let change_encoder = |idx| VialKeymapWrite::Encoder {
+                layer: 0,
+                idx,
+                clockwise: true,
+                action: KeyAction::Transparent,
+            };
+            select(storage.run_with_vial_keymap(&keymap), async {
+                assert!(!save_vial_keymap(change_encoder(1)).await);
+                assert!(save_vial_keymap(change_encoder(0)).await);
+                assert_eq!(keymap.action_at_pos(0, 0, 0), KeyAction::Transparent);
+            })
+            .await;
+
+            assert!(matches!(
+                storage.fetch_data(StorageKey::keymap(0, 0, 0)).await,
+                Some(StorageData::KeyAction(KeyAction::Transparent))
+            ));
+            assert!(matches!(
+                storage.fetch_data(StorageKey::encoder(0, 0)).await,
+                Some(StorageData::EncoderAction(EncoderAction {
+                    clockwise: KeyAction::Transparent,
+                    counter_clockwise: KeyAction::No
+                }))
+            ));
+
+            storage.flash.flash().writes_before_error = Some(0);
+            select(storage.run_with_vial_keymap(&keymap), async {
+                assert!(
+                    !save_vial_keymap(VialKeymapWrite::Key {
+                        layer: 0,
+                        row: 0,
+                        col: 0,
+                        action: KeyAction::No
+                    })
+                    .await
+                );
+            })
+            .await;
+            assert_eq!(keymap.action_at_pos(0, 0, 0), KeyAction::Transparent);
+        });
+    }
+
     #[derive(Debug, Clone, Copy)]
     struct TestFlashError;
 
@@ -888,11 +1025,19 @@ mod tests {
 
     struct TestFlash<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize> {
         bytes: [u8; SIZE],
+        writes_before_power_cut: Option<usize>,
+        writes_before_error: Option<usize>,
+        fail_next_erase: bool,
     }
 
     impl<const SIZE: usize, const ERASE_SIZE: usize, const WRITE_SIZE: usize> TestFlash<SIZE, ERASE_SIZE, WRITE_SIZE> {
         fn new() -> Self {
-            Self { bytes: [0xFF; SIZE] }
+            Self {
+                bytes: [0xFF; SIZE],
+                writes_before_power_cut: None,
+                writes_before_error: None,
+                fail_next_erase: false,
+            }
         }
     }
 
@@ -926,6 +1071,9 @@ mod tests {
         const ERASE_SIZE: usize = ERASE_SIZE;
 
         fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+            if core::mem::take(&mut self.fail_next_erase) {
+                return Err(TestFlashError);
+            }
             self.bytes[from as usize..to as usize].fill(0xFF);
             Ok(())
         }
@@ -965,6 +1113,15 @@ mod tests {
         }
 
         async fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+            if let Some(remaining) = &mut self.writes_before_error {
+                *remaining = remaining.checked_sub(1).ok_or(TestFlashError)?;
+            }
+            if let Some(remaining) = &mut self.writes_before_power_cut {
+                if *remaining == 0 {
+                    return core::future::pending().await;
+                }
+                *remaining -= 1;
+            }
             embedded_storage::nor_flash::NorFlash::write(self, offset, bytes)
         }
     }
@@ -972,7 +1129,7 @@ mod tests {
     #[test]
     fn storage_key_round_trip() {
         let cases = [
-            StorageKey::StorageConfig,
+            StorageKey::FormatVersion,
             StorageKey::LayoutConfig,
             StorageKey::BehaviorConfig,
             StorageKey::ConnectionType,
@@ -1010,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn build_hash_mismatch_reinitializes_storage() {
+    fn format_version_mismatch_reinitializes_storage() {
         block_on(async {
             type Flash = TestFlash<16_384, 4_096, 1>;
 
@@ -1021,11 +1178,8 @@ mod tests {
 
             map.store_item(
                 &mut buffer,
-                &StorageKey::StorageConfig,
-                &StorageData::StorageConfig(LocalStorageConfig {
-                    enable: true,
-                    build_hash: BUILD_HASH.wrapping_sub(1),
-                }),
+                &StorageKey::FormatVersion,
+                &StorageData::FormatVersion([STORAGE_FORMAT[0], STORAGE_FORMAT[1].wrapping_add(1)]),
             )
             .await
             .unwrap();
@@ -1058,7 +1212,7 @@ mod tests {
             .await;
 
             let stored_layout = storage.fetch_data(StorageKey::LayoutConfig).await.unwrap();
-            let stored_config = storage.fetch_data(StorageKey::StorageConfig).await.unwrap();
+            let stored_config = storage.fetch_data(StorageKey::FormatVersion).await.unwrap();
 
             assert!(matches!(
                 stored_layout,
@@ -1067,13 +1221,173 @@ mod tests {
                     layout_option: 0,
                 })
             ));
+            assert!(matches!(stored_config, StorageData::FormatVersion(STORAGE_FORMAT)));
+        });
+    }
+
+    #[test]
+    fn interrupted_initialization_is_retried() {
+        block_on(async {
+            type Flash = TestFlash<16_384, 4_096, 1>;
+            let mut flash = Flash::new();
+            // 让布局记录先落盘，再在默认设置写完前断电。
+            flash.writes_before_power_cut = Some(4);
+            let config = RuntimeStorageConfig::default();
+            let behavior = RuntimeBehaviorConfig::default();
+            #[cfg(feature = "host")]
+            let keymap = [[[KeyAction::Transparent; 1]; 1]; 1];
+            #[cfg(feature = "host")]
+            let mut encoders = [[crate::encoder!(KeyAction::Transparent, KeyAction::Transparent)]];
+            #[cfg(feature = "host")]
+            let encoder_map = Some(&mut encoders);
+
+            let result = embassy_time::with_timeout(
+                Duration::from_millis(1),
+                Storage::<_, 1, 1, 1, 1>::new(
+                    &mut flash,
+                    #[cfg(feature = "host")]
+                    &keymap,
+                    #[cfg(feature = "host")]
+                    &encoder_map,
+                    &config,
+                    &behavior,
+                ),
+            )
+            .await;
+            assert!(result.is_err());
+
+            flash.writes_before_power_cut = None;
+            let range = (16_384 - 2 * 4_096) as u32..16_384u32;
+            let mut interrupted =
+                MapStorage::<StorageKey, _, _>::new(&mut flash, MapConfig::new(range), Cache::new_uncached());
+            let mut buffer = [0; 256];
             assert!(matches!(
-                stored_config,
-                StorageData::StorageConfig(LocalStorageConfig {
-                    enable: true,
-                    build_hash: BUILD_HASH,
-                })
+                interrupted.fetch_item(&mut buffer, &StorageKey::LayoutConfig).await,
+                Ok(Some(StorageData::LayoutConfig(_)))
             ));
+            assert!(matches!(
+                interrupted
+                    .fetch_item::<StorageData>(&mut buffer, &StorageKey::FormatVersion)
+                    .await,
+                Ok(None)
+            ));
+
+            let mut storage = Storage::<_, 1, 1, 1, 1>::new(
+                flash,
+                #[cfg(feature = "host")]
+                &keymap,
+                #[cfg(feature = "host")]
+                &encoder_map,
+                &config,
+                &behavior,
+            )
+            .await;
+            assert!(matches!(
+                storage.fetch_data(StorageKey::FormatVersion).await,
+                Some(StorageData::FormatVersion(STORAGE_FORMAT))
+            ));
+            assert!(matches!(
+                storage.fetch_data(StorageKey::BehaviorConfig).await,
+                Some(StorageData::BehaviorConfig(_))
+            ));
+            #[cfg(feature = "host")]
+            {
+                assert!(matches!(
+                    storage.fetch_data(StorageKey::keymap(0, 0, 0)).await,
+                    Some(StorageData::KeyAction(KeyAction::Transparent))
+                ));
+                assert!(matches!(
+                    storage.fetch_data(StorageKey::encoder(0, 0)).await,
+                    Some(StorageData::EncoderAction(EncoderAction {
+                        clockwise: KeyAction::Transparent,
+                        counter_clockwise: KeyAction::Transparent,
+                    }))
+                ));
+            }
+        });
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn storage_repair_fault_retains_current_settings() {
+        block_on(async {
+            type Flash = TestFlash<16_384, 4_096, 4>;
+            let mut storage = Storage::<_, 1, 1, 1, 0>::new(
+                Flash::new(),
+                &[[[KeyAction::No]]],
+                &None,
+                &RuntimeStorageConfig::default(),
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+            storage
+                .store_data(
+                    StorageKey::LayoutConfig,
+                    &StorageData::LayoutConfig(LayoutConfig {
+                        default_layer: 0,
+                        layout_option: 42,
+                    }),
+                )
+                .await
+                .unwrap();
+
+            let first_page = storage.flash.flash_range().start as usize;
+            let second_page = first_page + 4_096;
+            let (mut flash, _) = storage.flash.destroy();
+            // 模拟第一页擦除中断，仅留页尾标记，正常记录留在第二页。
+            flash.bytes.copy_within(first_page..second_page, second_page);
+            flash.bytes[first_page..second_page].fill(0xFF);
+            flash.bytes[second_page - 1] = 0;
+            flash.fail_next_erase = true;
+
+            let mut restarted = Storage::<_, 1, 1, 1, 0>::new(
+                flash,
+                &[[[KeyAction::No]]],
+                &None,
+                &RuntimeStorageConfig::default(),
+                &RuntimeBehaviorConfig::default(),
+            )
+            .await;
+            assert!(matches!(
+                restarted.fetch_data(StorageKey::LayoutConfig).await,
+                Some(StorageData::LayoutConfig(LayoutConfig { layout_option: 42, .. }))
+            ));
+        });
+    }
+
+    #[test]
+    fn storage_startup_write_fault_rejects_runtime_save() {
+        use crate::config::PositionalConfig;
+        use crate::core_traits::Runnable;
+        use crate::keymap::KeymapData;
+        use embassy_futures::select::{Either, select};
+
+        block_on(async {
+            type Flash = TestFlash<16_384, 4_096, 1>;
+            let mut flash = Flash::new();
+            flash.writes_before_error = Some(4);
+            let mut data = KeymapData::new([[[crate::types::action::KeyAction::No]]]);
+            let mut behavior = RuntimeBehaviorConfig::default();
+            let positional = PositionalConfig::default();
+            let (keymap, mut storage) = crate::initialize_keymap_and_storage(
+                &mut data,
+                flash,
+                &RuntimeStorageConfig::default(),
+                &mut behavior,
+                &positional,
+            )
+            .await;
+            assert!(!storage.ready);
+            assert_eq!(keymap.active_layer(), 0);
+            #[cfg(feature = "vial")]
+            assert_eq!(keymap.storage_ready, Some(false));
+            storage.flash.flash().writes_before_error = None;
+            let response = select(storage.run(), async {
+                FLASH_CHANNEL.send(FlashOperationMessage::LayoutOptions(42)).await;
+                FLASH_OPERATION_FINISHED.wait().await
+            })
+            .await;
+            assert!(matches!(response, Either::Second(false)));
         });
     }
 
@@ -1092,46 +1406,44 @@ mod tests {
 
         block_on(async {
             type Flash = TestFlash<16_384, 4_096, 1>;
-
-            let storage_range = (16_384 - 2 * 4_096) as u32..16_384u32;
-            let mut map =
-                MapStorage::<StorageKey, _, _>::new(Flash::new(), MapConfig::new(storage_range), Cache::new_uncached());
-            let mut buffer = [0u8; 256];
-
-            // A matching build hash keeps the stored records across the boot.
-            map.store_item(
-                &mut buffer,
-                &StorageKey::StorageConfig,
-                &StorageData::StorageConfig(LocalStorageConfig {
-                    enable: true,
-                    build_hash: BUILD_HASH,
-                }),
-            )
-            .await
-            .unwrap();
-            map.store_item(
-                &mut buffer,
-                &StorageKey::LayoutConfig,
-                &StorageData::LayoutConfig(LayoutConfig {
-                    default_layer: 0,
-                    layout_option: 42,
-                }),
-            )
-            .await
-            .unwrap();
-
-            let (flash, _) = map.destroy();
             let keymap_init = [[[KeyAction::No; 1]; 1]; 1];
-            let encoder_map_init: Option<&mut [[EncoderAction; 0]; 1]> = None;
+            let storage_config = RuntimeStorageConfig::default();
+            let behavior_config = RuntimeBehaviorConfig::default();
+            let boot = |flash| {
+                Storage::<Flash, 1, 1, 1, 0>::new(flash, &keymap_init, &None, &storage_config, &behavior_config)
+            };
+            let mut storage = boot(Flash::new()).await;
 
-            let mut storage = Storage::<Flash, 1, 1, 1, 0>::new(
-                flash,
-                &keymap_init,
-                &encoder_map_init,
-                &RuntimeStorageConfig::default(),
-                &RuntimeBehaviorConfig::default(),
-            )
-            .await;
+            // 存储格式版本相同，重启时应保留已有设置。
+            storage
+                .store_data(
+                    StorageKey::LayoutConfig,
+                    &StorageData::LayoutConfig(LayoutConfig {
+                        default_layer: 0,
+                        layout_option: 42,
+                    }),
+                )
+                .await
+                .unwrap();
+            #[cfg(feature = "_ble")]
+            storage
+                .store_data(
+                    StorageKey::bond_info(2),
+                    &StorageData::BondInfo(ProfileInfo {
+                        slot_num: 2,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+
+            let (flash, _) = storage.flash.destroy();
+            let mut storage = boot(flash).await;
+            #[cfg(feature = "_ble")]
+            assert!(matches!(
+                storage.fetch_data(StorageKey::bond_info(2)).await,
+                Some(StorageData::BondInfo(ProfileInfo { slot_num: 2, .. }))
+            ));
 
             // Boot-time restore path: storage -> KeymapData -> KeyMap::build.
             let mut data = KeymapData::new([[[KeyAction::No]]]);

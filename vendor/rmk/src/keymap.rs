@@ -5,10 +5,7 @@ use rmk_types::action::{EncoderAction, KeyAction};
 use rmk_types::fork::Fork;
 use rmk_types::morse::{Morse, MorseProfile};
 #[cfg(all(feature = "storage", feature = "host"))]
-use {
-    crate::{boot::reboot_keyboard, storage::Storage},
-    embedded_storage_async::nor_flash::NorFlash,
-};
+use {crate::storage::Storage, embedded_storage_async::nor_flash::NorFlash};
 
 use crate::MACRO_SPACE_SIZE;
 use crate::config::{BehaviorConfig, Hand, MouseKeyConfig, OneShotModifiersConfig, PositionalConfig};
@@ -83,6 +80,9 @@ pub(crate) fn fill_vec<T: Default + Clone, const N: usize>(vector: &mut heapless
 /// All const generic parameters are erased at construction time.
 pub struct KeyMap<'a> {
     inner: RefCell<KeyMapInner<'a>>,
+    #[cfg(all(feature = "storage", feature = "vial"))]
+    // 无存储时允许只修改内存，有存储但故障时拒绝配置写入。
+    pub(crate) storage_ready: Option<bool>,
 }
 
 struct KeyMapInner<'a> {
@@ -373,6 +373,8 @@ impl<'a> KeyMap<'a> {
         let hand = positional_config.hand.as_slice().as_flattened();
 
         KeyMap {
+            #[cfg(all(feature = "storage", feature = "vial"))]
+            storage_ready: None,
             inner: RefCell::new(KeyMapInner {
                 row: ROW,
                 col: COL,
@@ -413,7 +415,7 @@ impl<'a> KeyMap<'a> {
         const NUM_ENCODER: usize,
     >(
         data: &'a mut KeymapData<ROW, COL, NUM_LAYER, NUM_ENCODER>,
-        storage: Option<&mut Storage<F, ROW, COL, NUM_LAYER, NUM_ENCODER>>,
+        mut storage: Option<&mut Storage<F, ROW, COL, NUM_LAYER, NUM_ENCODER>>,
         behavior: &'a mut BehaviorConfig,
         positional_config: &'a PositionalConfig<ROW, COL>,
     ) -> Self {
@@ -421,7 +423,7 @@ impl<'a> KeyMap<'a> {
         fill_vec(&mut behavior.morse.morses);
 
         // Read from storage BEFORE flattening (storage expects typed arrays).
-        if let Some(storage) = storage
+        if let Some(storage) = storage.as_deref_mut().filter(|storage| storage.ready)
             && {
                 Ok(())
                     .and(storage.read_keymap(data, behavior).await)
@@ -437,12 +439,17 @@ impl<'a> KeyMap<'a> {
             }
             .is_err()
         {
-            error!("Failed to read from storage, clearing...");
-            storage.flash.erase_all().await.ok();
-            reboot_keyboard();
+            storage.ready = false;
+            error!("Flash restore failed, storage unavailable for this boot");
         }
 
-        Self::build(data, behavior, positional_config)
+        let keymap = Self::build(data, behavior, positional_config);
+        #[cfg(feature = "vial")]
+        let keymap = Self {
+            storage_ready: storage.map(|storage| storage.ready),
+            ..keymap
+        };
+        keymap
     }
 
     pub(crate) fn get_action_with_layer_cache(&self, event: KeyboardEvent) -> KeyAction {
@@ -718,58 +725,45 @@ impl<'a> KeyMap<'a> {
         }
     }
 
-    pub(crate) fn set_action_by_flat_index(&self, index: usize, action: KeyAction) {
-        let mut inner = self.inner.borrow_mut();
-        if index < inner.layers.len() {
-            inner.layers[index] = action;
-        }
-    }
-
     pub(crate) fn num_encoders(&self) -> usize {
         self.inner.borrow().num_encoder
     }
 
     pub(crate) fn get_encoder_action(&self, layer: usize, id: usize) -> Option<EncoderAction> {
         let inner = self.inner.borrow();
+        if layer >= inner.num_layer || id >= inner.num_encoder {
+            return None;
+        }
         inner.encoders.as_ref().and_then(|encoders| {
             let idx = inner.encoder_index(layer, id);
             encoders.get(idx).copied()
         })
     }
 
-    pub(crate) fn set_encoder_clockwise(&self, layer: usize, id: usize, action: KeyAction) -> Option<EncoderAction> {
-        let mut inner = self.inner.borrow_mut();
-        let idx = inner.encoder_index(layer, id);
-        if let Some(encoders) = &mut inner.encoders
-            && let Some(encoder_action) = encoders.get_mut(idx)
-        {
-            encoder_action.clockwise = action;
-            return Some(*encoder_action);
-        }
-        None
-    }
-
-    pub(crate) fn set_encoder_counter_clockwise(
+    #[cfg(feature = "vial")]
+    pub(crate) fn encoder_with_direction(
         &self,
         layer: usize,
         id: usize,
+        clockwise: bool,
         action: KeyAction,
     ) -> Option<EncoderAction> {
-        let mut inner = self.inner.borrow_mut();
-        let idx = inner.encoder_index(layer, id);
-        if let Some(encoders) = &mut inner.encoders
-            && let Some(encoder_action) = encoders.get_mut(idx)
-        {
+        let mut encoder_action = self.get_encoder_action(layer, id)?;
+        if clockwise {
+            encoder_action.clockwise = action;
+        } else {
             encoder_action.counter_clockwise = action;
-            return Some(*encoder_action);
         }
-        None
+        Some(encoder_action)
     }
 
     /// Write both directions of an encoder under one borrow. Returns `false`
     /// if the slot is out of range.
     pub(crate) fn set_encoder(&self, layer: usize, id: usize, action: EncoderAction) -> bool {
         let mut inner = self.inner.borrow_mut();
+        if layer >= inner.num_layer || id >= inner.num_encoder {
+            return false;
+        }
         let idx = inner.encoder_index(layer, id);
         if let Some(encoders) = &mut inner.encoders
             && let Some(slot) = encoders.get_mut(idx)

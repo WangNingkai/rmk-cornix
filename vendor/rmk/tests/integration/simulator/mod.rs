@@ -150,7 +150,7 @@ impl<const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_ENCOD
             Box::leak(Box::new(self.positional_config)),
         )
         .await;
-        let keymap = Box::leak(Box::new(keymap));
+        let keymap: &KeyMap<'_> = Box::leak(Box::new(keymap));
         SimKeyboard {
             keyboard: Keyboard::new(keymap),
             #[cfg(feature = "host")]
@@ -158,7 +158,12 @@ impl<const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_ENCOD
             #[cfg(feature = "host")]
             rmk_config: self.rmk_config,
             steps: Vec::new(),
-            storage: Some(Box::pin(async move { storage.run().await })),
+            storage: Some(Box::pin(async move {
+                #[cfg(feature = "vial")]
+                storage.run_with_vial_keymap(keymap).await;
+                #[cfg(not(feature = "vial"))]
+                storage.run().await;
+            })),
         }
     }
 }

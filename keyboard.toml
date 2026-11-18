@@ -117,6 +117,7 @@ _       _    _    _    Semicolon  Minus        Equal  Quote _          _        
 _       _    _    _    _          _     _   _  _      _     LeftBracket RightBracket _    _
 _       _    _    _    _          _            _      _     _          _             _    _
 """
+encoders = [["_", "_"], ["_", "_"]]
 
 [[keymap.layer]]
 name = "function_layer"
@@ -126,6 +127,7 @@ User0  _      _   _   _   _          _   _   _   _    _    _
 User1  _      _   _   _   _   _   _  _   _   _   _    _    _
 User2  User7  _   _   _   _          _   _   _   _    _    _
 """
+encoders = [["_", "_"], ["_", "_"]]
 
 [[keymap.layer]]
 name = "bluetooth_layer"
@@ -135,6 +137,18 @@ User0  _  _  _  _  _         _  _  _  _  _  _
 User1  _  _  _  _  _   _  _  _  _  _  _  _  _
 User2  _  _  _  _  _         _  _  _  _  _  _
 """
+encoders = [["_", "_"], ["_", "_"]]
+
+[[keymap.layer]]
+name = "custom_layer"
+# MO(4) 进入这一层，可在 Vial 中设置自定义动作。
+keys = """
+_  _  _  _  _  _        _  _  _  _  _  _
+_  _  _  _  _  _        _  _  _  _  _  _
+_  _  _  _  _  _  _  _  _  _  _  _  _  _
+_  _  _  _  _  _        _  _  _  _  _  _
+"""
+encoders = [["_", "_"], ["_", "_"]]
 
 [behavior.one_shot]
 timeout = "3s"

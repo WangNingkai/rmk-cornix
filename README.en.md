@@ -45,6 +45,10 @@ It uses RMK `0.9.0`, the nRF52840, and the Adafruit Bootloader.
 - The LED state machine runs independently of the hardware so host-side tests can exercise the same logic used by the firmware.
 - The firmware occupies `[0x1000, 0xA0000)`, a 636 KiB region. Configuration storage remains in `[0xA0000, 0xC0000)`,
   which is 128 KiB across 32 sectors of 4 KiB each. The linker enforces the firmware limit to protect saved configuration.
+- Flash configuration has a format version. The firmware records it when initialization completes and retries on the next
+  boot if power is interrupted during initialization.
+- A failed Flash check or initialization is retried once at startup. If storage is still unavailable, Vial configuration and
+  Flash saving pause until the next boot.
 - CI checks formatting, Clippy, LED state, Flash partition boundaries, and the RMK library before building the firmware and UF2 files.
 
 If you change the Flash layout, update both [`keyboard.toml`](keyboard.toml) and [`memory.x`](memory.x) and review how to
@@ -83,13 +87,10 @@ Breathing uses gamma correction, and LED states transition with a fade.
 
 ### Back up before upgrading
 
-Export your Vial `.vil` configuration and keep the previous pair of UF2 files before flashing. RMK's build hash includes the
-build time. A hash change can reinitialize storage even with `clear_storage = false`. Rolling back can also require restoring
-your configuration.
-
-Flash both halves with firmware from the same build. After upgrading, remove the old Bluetooth pairing from your computer or
-phone and pair again. Restore your keymap and check the keys, encoders, macros, combos, and Tap Dance settings. To roll back,
-use the left and right UF2 files you saved from the same previous build.
+Flash both halves with firmware from the same build. Upgrading from an older release to storage format 1 clears the saved
+configuration and loads the default keymap. Remove the old Bluetooth pairing from your computer or phone and pair again.
+Future builds using the same storage format retain Vial settings and Bluetooth pairings. You can export your Vial `.vil`
+configuration and keep the previous pair of UF2 files before flashing for restoration or rollback.
 
 ### Build locally
 
@@ -100,9 +101,10 @@ You need Rust `stable`, `flip-link`, `cargo-make`, and the UF2 conversion tools.
 You also need the ARM GNU bare-metal toolchain, including `arm-none-eabi-gcc`, `arm-none-eabi-ar`, and the newlib headers.
 Add the toolchain's `bin` directory to `PATH` so the Bluetooth cryptography dependency can compile its C and assembly code.
 
-The default keys and encoders in [`keyboard.toml`](keyboard.toml) come from a Vial export. Four layers have preset bindings,
-and keys on the other six layers fall through to lower layers. Saved bindings take priority until the firmware initializes
-storage. Edit the configuration as needed, then build the flashable files from the repository root.
+The default keys and encoders in [`keyboard.toml`](keyboard.toml) come from a Vial export. Encoders on the number, function,
+and Bluetooth layers inherit the base layer's volume and track controls. `MO(4)` opens the custom layer, which is transparent
+by default and can be configured in Vial. Saved bindings take priority until the firmware initializes storage.
+Edit the configuration as needed, then build the flashable files from the repository root.
 
 ```sh
 cargo make uf2
@@ -179,10 +181,13 @@ KEYBOARD_TOML_PATH="$PWD/tests/rmk.toml" cargo nextest run \
 ### Hardware checks
 
 - Check both halves' keys and encoders, and save and restore the Vial configuration.
+- Flash two independent builds using the same storage format and verify that custom Vial bindings and Bluetooth pairings persist.
 - Check battery readings, notification timing, and status LED priority on both halves.
 - Switch Bluetooth profiles, reboot either half, and check reconnection after a disconnect.
 - Keep the left half connected to a Bluetooth host, turn off the right half, and wait for the left half to sleep. Turn the right
   half back on using only its power switch. Check that input resumes, and record the time to reconnect and the left half's power
   draw while the right half is offline.
+- Leave the right half powered, turn off the left half for about six minutes, then turn it back on. Leave the right half's keys
+  untouched and record whether it reconnects on its own and how long it takes.
 - Check for unintended host wake-ups and verify the first keystroke after keyboard sleep.
 - Measure the LED PWM waveform and actual power consumption.
