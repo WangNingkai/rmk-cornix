@@ -2,8 +2,11 @@ name: Build RMK firmware
 on:
   workflow_dispatch:
   push:
-    paths:
-      - "**"
+    branches: ['**']
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -11,6 +14,8 @@ jobs:
     env:
       KEYBOARD_TOML_PATH: keyboard.toml
       VIAL_JSON_PATH: vial.json
+      # 让 Bindgen 使用 Cortex-M 的标准整数定义，避免转发到宿主头文件。
+      BINDGEN_EXTRA_CLANG_ARGS_thumbv7em_none_eabihf: -ffreestanding
     steps:
       - uses: actions/checkout@v4
 
@@ -30,17 +35,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
 
-      - name: Install nextest
-        run: cargo install cargo-nextest --locked --version 0.9.152
-
-      - name: Install cargo-make
-        run: cargo install cargo-make --locked --version 0.37.24
-
       - name: Check formatting
         run: cargo fmt --check
 
       - name: Run clippy
-        run: cargo clippy --release --bins -- -D warnings
+        run: cargo clippy --release --locked --bins -- -D warnings
 
       - name: Test status LED state
         run: |
@@ -50,6 +49,9 @@ jobs:
 
       - name: Check flash layout
         run: python3 tests/test_memory_layout.py
+
+      - name: Install nextest
+        run: cargo install cargo-nextest --locked --version 0.9.152
 
       - name: Run RMK library tests
         env:
@@ -61,8 +63,8 @@ jobs:
           --features std,log,split,_ble,vial,storage
           --lib
 
-      - name: Build release binaries
-        run: cargo build --release
+      - name: Install cargo-make
+        run: cargo install cargo-make --locked --version 0.37.24
 
       - name: Build UF2 artifacts
         run: cargo make uf2
@@ -71,8 +73,37 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rmk-cornix-firmware
+          if-no-files-found: error
           path: |
             rmk-cornix-central.hex
             rmk-cornix-central.uf2
             rmk-cornix-peripheral.hex
             rmk-cornix-peripheral.uf2
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag' && !github.event.deleted
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: rmk-cornix-firmware
+          path: firmware
+
+      - name: Package and publish firmware
+        working-directory: firmware
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          left=rmk-cornix-central.uf2
+          right=rmk-cornix-peripheral.uf2
+          archive="rmk-cornix-${GITHUB_REF_NAME}.zip"
+          test -s "$left"
+          test -s "$right"
+          zip -q "$archive" "$left" "$right"
+          sha256sum "$archive" > SHA256SUMS
+
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --generate-notes "$archive" SHA256SUMS

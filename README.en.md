@@ -108,8 +108,10 @@ cargo make uf2
 
 ### Download and flash
 
-You can also fork the repository, run **Build RMK firmware** manually in GitHub Actions, and download the
-`rmk-cornix-firmware` artifact from that run. Put each half in Bootloader mode and flash its corresponding UF2.
+Download the versioned ZIP and `SHA256SUMS` from [GitHub Releases](https://github.com/WangNingkai/rmk-cornix/releases).
+Run `sha256sum -c SHA256SUMS` in the download directory (`shasum -a 256 -c SHA256SUMS` on macOS), then extract the ZIP.
+For a test build, run **Build RMK firmware** manually in GitHub Actions and download the `rmk-cornix-firmware` artifact
+from that run. Put each half in Bootloader mode and flash its corresponding UF2.
 
 | File | Use |
 | --- | --- |
@@ -118,6 +120,9 @@ You can also fork the repository, run **Build RMK firmware** manually in GitHub 
 | `rmk-cornix-central.hex`, `rmk-cornix-peripheral.hex` | Intel HEX images for the corresponding halves |
 
 `cargo build --release --locked` creates the ELF files under `target/`. `cargo make uf2` also converts them to UF2.
+
+Pushing a `vMAJOR.MINOR.PATCH` tag triggers a release. After the checks and build pass, CI packages both UF2 files
+from that run into one ZIP and publishes it with the checksum file.
 
 For details on the RMK upgrade, see the [official migration guide](https://rmk.rs/docs/migration/v08_v09).
 

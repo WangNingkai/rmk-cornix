@@ -102,7 +102,9 @@ cargo make uf2
 
 ### 下载与刷机
 
-也可 Fork 仓库，在 GitHub Actions 中手动运行 **Build RMK firmware**，完成后从同一次运行
+从 [GitHub Releases](https://github.com/WangNingkai/rmk-cornix/releases) 下载版本 ZIP 和 `SHA256SUMS`。
+在下载目录运行 `sha256sum -c SHA256SUMS`（macOS 可用 `shasum -a 256 -c SHA256SUMS`），
+校验后解压。测试版也可在 GitHub Actions 手动运行 **Build RMK firmware**，从同一次运行
 下载 `rmk-cornix-firmware` 产物。将左右半分别置于 Bootloader 模式，刷入各自的 UF2。
 
 | 文件 | 用途 |
@@ -112,6 +114,9 @@ cargo make uf2
 | `rmk-cornix-central.hex`、`rmk-cornix-peripheral.hex` | 对应半边的 HEX 固件 |
 
 `cargo build --release --locked` 生成 `target/` 下的 ELF，`cargo make uf2` 完成 UF2 转换。
+
+推送 `v主版本.次版本.修订号` 格式的标签会触发正式发布。检查和构建通过后，CI 将同一次运行
+的左右半 UF2 打成一个 ZIP，连同校验文件一并发布。
 
 参考：[RMK 官方迁移指南](https://rmk.rs/docs/migration/v08_v09)。
 
